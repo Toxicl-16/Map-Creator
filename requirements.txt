@@ -1,0 +1,16 @@
+# Core dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+aiohttp>=3.10.0
+numpy>=2.0.0
+
+# STL validation
+pystl>=0.3.0
+
+# Data processing
+rasterio>=1.4.0  # optional: if using raster elevation tiles
+tifffile>=2024.0.0
+
+# CORS (needed for frontend)
+python-multipart>=0.0.17
+python-dotenv>=1.0.1

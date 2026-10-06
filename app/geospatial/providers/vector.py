@@ -63,11 +63,21 @@ class OverpassClient:
                         )
                         await asyncio.sleep(1)
                     else:
-                        text = await resp.text(max_size=8000)
-                        logger.debug("Overpass returned status %d: %s", resp.status, text)
+                        # Truncate the body ourselves: ClientResponse.text()
+                        # takes no size argument.
+                        body = (await resp.text())[:8000]
+                        logger.warning(
+                            "Overpass returned status %d: %s", resp.status, body
+                        )
 
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+            except asyncio.CancelledError:
+                raise
+            except aiohttp.ClientError:
                 logger.warning("Failed to query Overpass API at %s", endpoint)
+                continue
+            except Exception:
+                # One bad endpoint or response must not abort the whole request.
+                logger.exception("Unexpected error querying Overpass at %s", endpoint)
                 continue
 
         logger.error("All Overpass endpoints failed")
@@ -111,7 +121,7 @@ class RoadFeatureProvider:
         query_str = (
             "[out:json][timeout:60];\n"
             f"( way {filter_str} ({south},{west},{north},{east}); );\n"
-            "out;"
+            "out geom;"
         )
 
         data = await self._client.query(query_str)
@@ -153,22 +163,22 @@ class BuildingFeatureProvider:
 
         query_str = (
             '[out:json][timeout:60];\n'
-            '( way["building"="yes"]('
-            f"{south},{west},{north},{east}"
-            ');'
-            ' way["building"="*"]('
-            f"{south},{west},{north},{east}"
-            '); ); out;'
-        )
+            "( way[\"building\"]({bbox}); );\n"
+            "out geom;"
+        ).format(bbox=f"{south},{west},{north},{east}")
 
         data = await self._client.query(query_str)
         if data is None:
             return []
 
         elements = data.get("elements", [])
+        # Keep every way that carries any building tag: the query already asks
+        # for building=* too, so filtering to building="yes" alone discarded
+        # houses, apartments, garages and the rest.
         buildings = [
-            elem for elem in elements
-            if elem.get("tags", {}).get("building") == "yes"
+            elem
+            for elem in elements
+            if elem.get("type") == "way" and elem.get("tags", {}).get("building")
         ]
         return buildings
 

@@ -1,19 +1,24 @@
 """Terrain generation service from elevation & vector data.
 
 Pipeline:
-    elevation grid -> UTM projection -> height mapping -> base mesh
-    + road polygons (extruded) + building footprints (extruded)
-    + optional contour lines -> unified mesh
-    + watertight validation -> binary STL output
+    elevation grid -> height scaling -> optional road/building/contour relief
+    -> unified heightfield -> closed manifold solid -> binary STL
 
-Coordinate system: WGS84 input -> UTM zone 326XX -> local metric grid in meters -> scaled mm model.
+Coordinate system: WGS84 input -> local metric grid in metres -> scaled mm model.
+
+The heightfield is extruded downwards to z=0 and capped, producing a closed,
+watertight, 2-manifold solid that slices cleanly. Roads, buildings and contour
+lines are folded into the same heightfield (see :mod:`app.services.features`)
+so they can never introduce non-manifold self-intersections the way separate
+unioned solids would.
 """
 
 import logging
-import math
 import struct
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -33,35 +38,46 @@ class TerrainSettings:
     model_depth_mm: float = 300  # Y dimension
 
     # Model scaling
-    resolution_m: float = 64.0  # elevation grid resolution in meters
+    resolution_m: float = 30.0  # elevation grid cell size in metres
 
     # Terrain height controls
-    min_altitude_mm: float = 2  # minimum terrain material thickness
-    max_altitude_mm: float = 50  # maximum terrain extrusion height
-    vertical_exaggeration: float = 1.0  # multiplier on terrain heights
-    elevation_offset_mm: float = 1  # offset from base (Z=0)
+    min_altitude_mm: float = 2.0  # thinnest terrain layer (always printable)
+    max_altitude_mm: float = 50.0  # tallest terrain relief
+    vertical_exaggeration: float = 1.0  # multiplier on true-scale relief
+    elevation_offset_mm: float = 1.0  # lift of the terrain above the base plate
 
     # Base plate settings
-    base_thickness_mm: float = 3  # thickness of bottom plate
-    base_extension_mm: float = 0  # overhang around edges
+    base_thickness_mm: float = 3.0  # thickness of bottom plate
+    base_extension_mm: float = 0.0  # overhang around edges
 
     # Smoothing
-    smoothing_passes: int = 2  # Gaussian blur iterations on elevation grid
+    smoothing_passes: int = 2  # binomial blur iterations on elevation grid
 
     # Feature toggles
     include_roads: bool = False
     include_buildings: bool = False
-    road_height_mm: float = 1.0
-
     include_contours: bool = False
-    contour_interval_m: float = 50
-    contour_thickness_mm: float = 0.5
+    road_height_mm: float = 1.2
+    road_width_mm: float = 1.6
+    road_min_width_mm: float = 0.8
+    building_height_mm: float = 6.0
+    building_min_height_mm: float = 3.0
+    building_footprint_scale: float = 1.0
+    contour_interval_m: float = 50.0
+    contour_major_interval_m: float = 250.0
+    contour_thickness_mm: float = 0.6
+    contour_height_mm: float = 0.8
+    contours_engraved: bool = False
 
     # Limits
     max_model_width_mm: float = 600
     max_model_depth_mm: float = 600
     min_resolution_m: float = 10
     max_resolution_m: float = 128
+
+    # Grid caps (protect against pathological meshes)
+    max_grid_nodes: int = 320
+    min_grid_nodes: int = 16
 
     @property
     def width(self) -> float:
@@ -84,313 +100,345 @@ class TerrainGenerationError(Exception):
     """
 
 
-def validate_settings(settings):
-    """Ensure terrain settings are within reasonable operational bounds."""
+def validate_settings(settings: TerrainSettings) -> list[str]:
+    """Return a list of human-readable problems with ``settings``.
 
-    if settings.model_width_mm < 1 or settings.model_depth_mm < 1:
-        logger.error("Model too small to print (< 1 mm)")
-        return False
+    An empty list means the configuration is safe to generate.
+    """
+    problems: list[str] = []
 
-    if not (0.5 <= settings.vertical_exaggeration <= 50):
-        logger.warning(
-            "Extreme vertical exaggeration: %.1fx", settings.vertical_exaggeration
+    if settings.model_width_mm <= 0 or settings.model_depth_mm <= 0:
+        problems.append("Model width and depth must be greater than zero.")
+
+    if settings.max_altitude_mm <= settings.min_altitude_mm:
+        problems.append(
+            "Maximum terrain height must exceed the minimum terrain thickness."
         )
 
-    if settings.model_width_mm > settings.max_model_width_mm:
-        logger.warning(
-            "Width %.1f mm exceeds recommended max %.0f mm",
-            settings.model_width_mm,
-            settings.max_model_width_mm,
+    if settings.base_thickness_mm < 0:
+        problems.append("Base thickness cannot be negative.")
+
+    if settings.vertical_exaggeration <= 0:
+        problems.append("Vertical exaggeration must be greater than zero.")
+
+    if settings.base_thickness_mm + settings.min_altitude_mm <= 0:
+        problems.append(
+            "Base thickness plus minimum terrain thickness leaves no printable material."
         )
 
-    if settings.min_altitude_mm >= settings.max_altitude_mm:
-        logger.error("min_altitude_mm (%.1f) >= max_altitude_mm (%.1f)",
-                     settings.min_altitude_mm, settings.max_altitude_mm)
-        return False
+    if settings.width <= 0 or settings.height <= 0:
+        problems.append("Selected area has zero width or height.")
 
-    degrees_span = max(settings.width, settings.height)
-    estimated_m = degrees_span * 111_000
-    if estimated_m > settings.max_resolution_m and settings.resolution_m < settings.min_resolution_m:
-        logger.warning(
-            "Area too large for chosen resolution: %.f m grid over %.1f km span",
-            settings.resolution_m, estimated_m / 1000)
+    if settings.include_contours and settings.contour_interval_m <= 0:
+        problems.append("Contour interval must be greater than zero metres.")
 
-    return True
+    if settings.include_roads and settings.road_min_width_mm < 0.4:
+        problems.append("Road width below 0.4 mm is unlikely to print.")
+
+    return problems
 
 
-def _utm_zone(lon):
-    """Derive the UTM zone number from a longitude value."""
-    return max(1, min(60, int((lon + 180) / 6) + 1))
+def _grid_shape(settings: TerrainSettings, width_m: float, height_m: float) -> tuple[int, int]:
+    """Rows × columns for the model grid at the requested ground resolution."""
+    cols = int(round(width_m / max(settings.resolution_m, 1e-6)))
+    rows = int(round(height_m / max(settings.resolution_m, 1e-6)))
+
+    # Scale the whole grid down if it exceeds the node cap.
+    limit = settings.max_grid_nodes
+    if cols > limit or rows > limit:
+        shrink = max(cols, rows) / limit
+        cols = max(settings.min_grid_nodes, int(cols / shrink))
+        rows = max(settings.min_grid_nodes, int(rows / shrink))
+
+    return max(2, rows), max(2, cols)
 
 
-def _wgs84_to_utm(west, south, east, north, resolution_m):
-    """Convert bounding box degrees to UTM projection info dict.
+def smooth_grid(grid, passes: int):
+    """Apply ``passes`` of a 3×3 binomial filter, preserving NaN voids."""
+    if passes <= 0:
+        return grid
 
-    Returns dict with keys:
-      center_lat   - center latitude (used for zone calculation)
-      easting_base - false easting of west edge in meters
-      northing     - northing of south edge in meters
-      x_step/y_step - grid spacing in metres
-      cols/rows    - grid sizes
+    kernel = np.array([[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]]) / 16.0
+    out = grid.astype(np.float64, copy=True)
+    valid = np.isfinite(out)
+
+    for _ in range(passes):
+        padded = np.pad(np.where(valid, out, 0.0), 1, mode="edge")
+        weight = np.pad(valid.astype(np.float64), 1, mode="edge")
+
+        num = sum(
+            kernel[r, c] * padded[r : r + out.shape[0], c : c + out.shape[1]]
+            for r in range(3)
+            for c in range(3)
+        )
+        den = sum(
+            kernel[r, c] * weight[r : r + out.shape[0], c : c + out.shape[1]]
+            for r in range(3)
+            for c in range(3)
+        )
+        out = np.divide(num, den, out=np.copy(out), where=den > 1e-9)
+
+    return out
+
+
+def scale_to_mm(
+    elev_m,
+    settings: TerrainSettings,
+    width_m: float,
+    height_m: float,
+):
+    """Convert metre elevations above the area minimum into model millimetres.
+
+    Uses a single isotropic scale (mm per metre of ground) so the model keeps
+    true proportions, then applies vertical exaggeration and clamps the result
+    to the printable height window.
     """
-    center_lat = (south + north) / 2.0
-    zone = _utm_zone((west + east) / 2.0)
+    elev = np.nan_to_num(np.asarray(elev_m, dtype=np.float64), nan=0.0)
+    floor_m = float(np.min(elev))
+    relief_m = elev - floor_m
 
-    # WGS84 constants
-    a_km = 6378.137
-    f_val = 1 / 298.257223563
-    e2 = 2 * f_val - f_val ** 2
-    k0 = 0.9996
+    # mm per metre of ground, isotropic so relief is not distorted.
+    mm_per_m = settings.model_width_mm / max(width_m, 1e-6)
+    mm_per_m_y = settings.model_depth_mm / max(height_m, 1e-6)
+    mm_per_m = min(mm_per_m, mm_per_m_y)
 
-    lat_rad = math.radians(center_lat)
-    sin_lat = math.sin(lat_rad)
-    cos_lat = math.cos(lat_rad)
+    scaled = relief_m * mm_per_m * settings.vertical_exaggeration
 
-    # Radius of curvature in the prime vertical
-    N_m = a_km * (1 - e2) / ((1 - e2 * sin_lat ** 2) ** 1.5)
+    lo = settings.min_altitude_mm
+    hi = settings.max_altitude_mm
+    if hi > lo and float(scaled.max()) > lo:
+        # Map the exaggerated relief onto [lo, hi] when it overflows the window,
+        # preserving relative shape below the cap.
+        peak = float(scaled.max())
+        if peak > hi:
+            scaled = scaled * (hi - lo) / peak + lo
 
-    # Meridional arc for northing
-    M_m = a_km * k0 * (
-        (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * lat_rad
-        - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * lat_rad)
-        + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * math.sin(4 * lat_rad)
-        - 35 * e2 ** 3 / 3072 * math.sin(6 * lat_rad)
-    )
-
-    # Easting from central meridian for west edge
-    lon_deg_west = west - (zone - 1) * 6 - 3
-    lon_rad_west = math.radians(lon_deg_west)
-    sin_lon = math.sin(lon_rad_west)
-    cos_lon = math.cos(lon_rad_west)
-    sin2_lon = sin_lon ** 2
-
-    easting_base_m = 500_000 + N_m * k0 * (
-        sin_lon
-        + (1 - e2 * sin_lat ** 2) / 6 * cos_lat ** 3 * sin2_lon * (4 - sin2_lon)
-    )
-
-    # Width in metres at UTM scale
-    easting_east_m = 500_000 + N_m * k0 * cos_lat * math.radians(east - west)
-
-    # North/South span in meters
-    north_m_val = M_m + N_m * k0 * cos_lat * math.radians(north - south)
-
-    width_km = max(0.001, easting_east_m - easting_base_m)
-    depth_km = max(0.001, north_m_val - M_m)
-
-    cols_count = int(max(2, round(width_km * 1000 / resolution_m)))
-    rows_count = int(max(2, round(depth_km * 1000 / resolution_m)))
-
-    return {
-        "center_lat": center_lat,
-        "easting_base": easting_base_m,
-        "northing": M_m,
-        "x_step": width_km * 1000 / max(cols_count, 2),
-        "y_step": depth_km * 1000 / max(rows_count, 2),
-        "cols": cols_count,
-        "rows": rows_count,
-        "west_m": easting_base_m,
-        "south_m": M_m,
-        "east_m": easting_east_m,
-        "north_m": north_m_val,
-        "zone": zone,
-    }
+    return np.clip(scaled, lo, hi)
 
 
-def _normalize_elevation(elev_array, min_height, max_height, vertical_exaggeration):
-    """Scale elevation array to [min_height, max_height] and apply exaggeration."""
-    import numpy as np
+def _grid_indices(rows: int, cols: int) -> List[Tuple[int, int]]:
+    """Boundary vertex loop, wound clockwise as seen from +Z.
 
-    elev = np.nan_to_num(elev_array, nan=0.0)
-    min_elev = float(np.min(elev))
-    max_elev_val = float(np.max(elev))
-    height_range = max_elev_val - min_elev
-
-    if abs(height_range) < 1e-6:
-        logger.warning("Flat terrain detected: %.2f == %.2f", min_elev, max_elev_val)
-        return np.full_like(elev, (min_height + max_height) / 2)
-
-    normed = (elev - min_elev) / height_range
-    scaled = normed * (max_height - min_height) + min_height
-
-    if abs(vertical_exaggeration - 1.0) > 0.01:
-        center_z = float(np.mean(scaled))
-        deviation_arr = scaled - center_z
-        abs_deviation = np.abs(deviation_arr)
-        max_abs_dev = float(np.max(abs_deviation)) if max_height > min_height else 1e-9
-
-        scale_factor = vertical_exaggeration / max(max_abs_dev, 1e-6)
-        normalized = deviation_arr * (abs(vertical_exaggeration) / max(abs(max_height - min_height), 1)) if abs(max_height - min_height) > 0 else deviation_arr * vertical_exaggeration
-        return np.array(normalized + center_z).clip(min_height, max_height)
-
-    return scaled.clip(min_height, max_height)
-
-
-def _grid_to_triangles(rows_count, cols_count):
-    """Return list of triangle vertex-index triplets for a row x col grid.
-
-    Triangles cover the grid in quads split along the north-east diagonal.
+    Row index 0 is the southern edge (y grows northward). Clockwise-from-above
+    is the reverse of the top surface's own boundary traversal, so skirt
+    triangles can share those edges directly while keeping every face wound
+    outward and the solid consistently oriented.
     """
-    triangles = []
-    for r_idx in range(rows_count - 1):
-        for c_idx in range(cols_count - 1):
-            idx00 = r_idx * cols_count + c_idx
-            idx01 = idx00 + 1
-            idx11 = (r_idx + 1) * cols_count + c_idx + 1
-            idx10 = (r_idx + 1) * cols_count + c_idx
-            # Two triangles per quad: NE-diagonal split
-            triangles.append((idx00, idx10, idx11))
-            triangles.append((idx00, idx11, idx01))
-    return triangles
+    loop: List[Tuple[int, int]] = []
+    loop += [(rows - 1, j) for j in range(cols)]                      # north, W→E
+    loop += [(i, cols - 1) for i in range(rows - 2, -1, -1)]          # east,  N→S
+    loop += [(0, j) for j in range(cols - 2, -1, -1)]                 # south, E→W
+    loop += [(i, 0) for i in range(1, rows - 1)]                  # west,  S→N
+    return loop
 
 
 class MeshBuilder:
-    """Build triangle mesh from terrain elevation grid and optionally OSM features.
+    """Build a closed triangle mesh from a terrain heightfield.
 
-    Output: tuple of (vertices : List[Tuple[float,float,float]],
-                       triangles : List[Tuple[int,int,int]])
-    Coordinates are in mm relative to model origin.
+    Output: ``(vertices, triangles)`` where ``vertices`` is an ``(N, 3)`` array
+    of millimetre coordinates and ``triangles`` an ``(M, 3)`` index array with
+    outward-facing, counter-clockwise winding.
     """
 
-    def __init__(self, settings):
+    def __init__(self, settings: TerrainSettings):
         self.settings = settings
 
-    def build(self, elev_grid, elevation_data_available=True):
-        """Build the unified mesh from an elevation grid.
+    # -- geometry helpers ---------------------------------------------------
 
-        Parameters
-        ----------
-        elev_grid : np.ndarray
-            2-D height map in metres.
-        elevation_data_available
-            Set False for synthetic test terrain instead.
+    def surface_of(self, elev_grid) -> "np.ndarray":
+        """Convert an elevation grid (metres) to the model's millimetre surface.
+
+        Callers that need to rasterise features must build them against this
+        array, because :meth:`build_with_features` folds feature heights into
+        exactly this surface. It is deterministic, so recomputing it there
+        yields the identical grid.
         """
-        import numpy as np
+        from app.utils.projection import bounds_to_meters
+        from app.models import GeoBounds
 
-        vertices = []
-        triangles = []
-        rows_count, cols_count = elev_grid.shape
         s = self.settings
-
-        # --- base plate (Z = 0) -------------------------------------------
-        base_plate_start = len(vertices)
-        platex = s.base_extension_mm
-        platedp = s.base_thickness_mm
-        if platedp > 0:
-            for iy in range(3):
-                for ix in range(3):
-                    vertices.append((-platex * 1.5 + ix * platex,
-                                     -platedp * 1.5 + iy * platedp, 0))
-            base_triangles = _grid_to_triangles(2, 2)
-            for tri_val in base_triangles:
-                triangles.append(tuple(v_idx + base_plate_start for v_idx in tri_val))
-
-        # --- terrain mesh ----------------------------------------------
-        utm_info = _wgs84_to_utm(s.west, s.south, s.east, s.north, s.resolution_m)
-        width_km = max(rows_count * utm_info["x_step"], 0.001)
-        height_km = max(cols_count * utm_info["y_step"], 0.001)
-
-        scale_x = s.model_width_mm / (width_km + s.base_extension_mm * 2)
-        scale_y = s.model_depth_mm / (height_km + s.base_extension_mm * 2)
-        mesh_scale = min(scale_x, scale_y)
-
-        # Height scaling: convert meter elevations to mm heights within range
-        elevation_range = float(elev_grid.max() - elev_grid.min())
-        if not elevation_data_available or abs(elevation_range) < 1e-9:
-            synthetic_data = np.linspace(
-                s.min_altitude_mm, s.max_altitude_mm, rows_count * cols_count
-            ).reshape((rows_count, cols_count))
-            elev_mm = (elev_grid - elev_grid.min()) / max(elev_grid.max() - elev_grid.min(), 1e-9) * (s.max_altitude_mm - s.min_altitude_mm) + s.min_altitude_mm
-        else:
-            elevation_height_range = s.max_altitude_mm - s.min_altitude_mm
-            elev_mm = _normalize_elevation(
-                elev_grid,
-                min_height=0.0,
-                max_height=elevation_height_range,
-                vertical_exaggeration=s.vertical_exaggeration,
+        grid = np.asarray(elev_grid, dtype=np.float64)
+        if grid.ndim != 2 or min(grid.shape) < 2:
+            raise TerrainGenerationError(
+                f"Elevation grid must be at least 2×2, received {grid.shape}."
             )
 
-        # Map mesh vertices to mm coordinates and build triangles
-        terrain_start = len(vertices)
-        for r_idx in range(rows_count):
-            for c_idx in range(cols_count):
-                x_pos = (c_idx / (cols_count - 1)) * s.model_width_mm if cols_count > 1 else s.model_width_mm / 2
-                y_pos = ((rows_count - 1 - r_idx) / (rows_count - 1)) * s.model_depth_mm if rows_count > 1 else s.model_depth_mm / 2
-                z_val = s.elevation_offset_mm + float(elev_mm[r_idx, c_idx])
-                vertices.append((x_pos, y_pos, z_val))
+        bounds = GeoBounds(west=s.west, south=s.south, east=s.east, north=s.north)
+        width_m, height_m = bounds_to_meters(bounds)
 
-        tri_indices = _grid_to_triangles(rows_count, cols_count)
-        for tri_val in tri_indices:
-            triangles.append(tuple(v_idx + terrain_start for v_idx in tri_val))
+        # Surface height = base plate top + lift + relief.
+        relief_mm = scale_to_mm(grid, s, width_m, height_m)
+        return s.base_thickness_mm + s.elevation_offset_mm + relief_mm
 
-        return (vertices, triangles)
+    def build(self, elev_grid) -> Tuple["np.ndarray", "np.ndarray"]:
+        """Build the watertight solid for ``elev_grid`` (metres, south→north)."""
+        surface = self.surface_of(elev_grid)
+        rows, cols = surface.shape
+        return self._extrude(surface, cols, rows)
+
+    def build_with_features(
+        self,
+        elev_grid,
+        *,
+        roads: Optional[dict] = None,
+        buildings: Optional[dict] = None,
+        contours: Optional[dict] = None,
+    ):
+        """Build the solid after folding optional features into the heightfield.
+
+        ``roads``/``buildings`` carry already-rasterised ``(mask, z)`` pairs in
+        millimetres, as produced by :mod:`app.services.features` when they are
+        given ``self.surface_of(elev_grid)``; ``contours`` carries a signed
+        offset mask in millimetres.
+        """
+        s = self.settings
+        surface = self.surface_of(elev_grid)
+        rows, cols = surface.shape
+
+        stats = {"roads": 0, "buildings": 0, "contours": 0}
+        floor = s.base_thickness_mm + s.min_altitude_mm
+
+        if roads:
+            surface, count = apply_raised(surface, roads, floor)
+            stats["roads"] = count
+        if buildings:
+            surface, count = apply_raised(surface, buildings, floor)
+            stats["buildings"] = count
+        if contours:
+            surface, count = apply_contours(surface, contours, floor)
+            stats["contours"] = count
+
+        vertices, triangles = self._extrude(surface, cols, rows)
+        return vertices, triangles, surface, stats
+
+    # -- extrusion ----------------------------------------------------------
+
+    def _extrude(self, surface, cols: int, rows: int):
+        """Turn a heightfield into a closed solid resting on z=0."""
+        s = self.settings
+
+        # Pad outward by the base extension so the skirt is vertical.
+        pad_x = s.base_extension_mm
+        pad_y = s.base_extension_mm
+        x = np.linspace(-pad_x, s.model_width_mm + pad_x, cols)
+        y = np.linspace(-pad_y, s.model_depth_mm + pad_y, rows)
+
+        xx, yy = np.meshgrid(x, y)
+        # The elevation grid's row 0 is the southern edge, matching y[0].
+        zz = np.asarray(surface, dtype=np.float64)
+
+        top_count = rows * cols
+
+        top_verts = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
+        bottom_verts = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(top_count)])
+        vertices = np.vstack([top_verts, bottom_verts]).astype(np.float64)
+
+        # Top surface: two triangles per quad, normals pointing +Z.
+        quads = []
+        for i in range(rows - 1):
+            base = i * cols
+            for j in range(cols - 1):
+                a = base + j
+                b = base + j + 1
+                c = (i + 1) * cols + j + 1
+                d = (i + 1) * cols + j
+                quads.append((a, c, d))
+                quads.append((a, b, c))
+        top_tris = np.array(quads, dtype=np.int64)
+
+        # Bottom cap: the same triangulation wound the other way, so its
+        # boundary runs opposite to the skirt's bottom edges and seals them.
+        cap = np.empty_like(top_tris)
+        for k in range(0, len(top_tris), 2):
+            t1, t2 = top_tris[k], top_tris[k + 1]
+            cap[k] = (top_count + t1[0], top_count + t1[2], top_count + t1[1])
+            cap[k + 1] = (top_count + t2[0], top_count + t2[2], top_count + t2[1])
+        bottom_tris = cap
+
+        # Skirt: one quad per boundary edge, extruded straight down to z=0.
+        loop = _grid_indices(rows, cols)
+        skirt = []
+        n = len(loop)
+        for k in range(n):
+            a = loop[k][0] * cols + loop[k][1]
+            b = loop[(k + 1) % n][0] * cols + loop[(k + 1) % n][1]
+            skirt.append((a, b, top_count + b))
+            skirt.append((a, top_count + b, top_count + a))
+        skirt_tris = np.array(skirt, dtype=np.int64)
+
+        triangles = np.vstack([top_tris, bottom_tris, skirt_tris])
+        return vertices, triangles
 
 
-def export_to_stl(vertices, triangles, output_path):
-    """Export mesh to binary STL file.
+def apply_raised(surface, feature: dict, floor_mm: float):
+    """Blend a ``(mask, z)`` feature into the surface with ``max`` semantics."""
+    mask = np.asarray(feature["mask"], dtype=bool)
+    z = np.asarray(feature["z"], dtype=np.float64)
+    count = int(np.count_nonzero(mask))
+    if count == 0:
+        return surface, 0
+
+    blended = np.maximum(surface, np.maximum(z, floor_mm))
+    return np.where(mask, blended, surface), count
+
+
+def apply_contours(surface, feature: dict, floor_mm: float):
+    """Apply a signed contour offset mask (raised ridges or engraved grooves)."""
+    mask = np.asarray(feature["mask"], dtype=bool)
+    offset = np.asarray(feature["offset"], dtype=np.float64)
+    count = int(np.count_nonzero(mask))
+    if count == 0:
+        return surface, 0
+
+    target = np.clip(surface + offset, floor_mm, None)
+    return np.where(mask, target, surface), count
+
+
+def export_to_stl(vertices, triangles, output_path) -> str:
+    """Export mesh to a binary STL file.
 
     Parameters
     ----------
-    vertices : list of (x,y,z) tuples in mm
-    triangles: list of (i,j,k) triangle index triplets
-    output_path: str or Path to write the binary STL
+    vertices : array-like of (x, y, z) tuples in mm
+    triangles : array-like of (i, j, k) triangle index triplets
+    output_path : str or Path to write the binary STL
 
-    Returns path on success.
+    Returns the output path as a string.
     """
-    import numpy as np
     import pathlib
 
-    out_path = pathlib.Path(output_path).resolve()
+    verts = np.asarray(vertices, dtype=np.float64)
+    tris = np.asarray(triangles, dtype=np.int64)
 
-    header_bytes = b"Terrain mesh generated by Map-Creator\n"
-    while len(header_bytes) < 80:
-        header_bytes += b"\0"
+    v0 = verts[tris[:, 0]]
+    v1 = verts[tris[:, 1]]
+    v2 = verts[tris[:, 2]]
 
-    # Count triangle face normals
-    num_triangles = len(triangles)
-    with open(out_path, "wb") as f:
-        f.write(header_bytes[:80])
-        f.write(struct.pack('<I', num_triangles))
+    # Face normals must be unit vectors per the binary STL spec. Winding gives
+    # the outward direction, so normalising the cross product is enough.
+    normals = np.cross(v0 - v1, v0 - v2)
+    lengths = np.linalg.norm(normals, axis=1)
+    safe = lengths > 1e-12
+    normals[safe] /= lengths[safe][:, None]
+    normals[~safe] = 0.0
 
-        for tri_val in triangles:
-            i0, i1, i2 = tri_val
-            v0 = np.array(vertices[i0])
-            v1 = np.array(vertices[i1])
-            v2 = np.array(vertices[i2])
+    # Binary STL: 80-byte header, uint32 count, 50 bytes per facet.
+    header = b"Terrain mesh generated by Map-Creator"
+    header = header[:80] + b"\x00" * (80 - len(header[:80]))
 
-            # Face normal (unnormalized)
-            nx_val = (v0[1] - v1[1]) * (v0[2] - v2[2]) - (v0[2] - v1[2]) * (v0[0] - v2[0])
-            ny_val = (v0[2] - v1[2]) * (v0[0] - v2[0]) - (v0[0] - v1[0]) * (v0[1] - v2[1])
-            nz_val = (v0[0] - v1[0]) * (v0[1] - v2[1]) - (v0[1] - v1[1]) * (v0[2] - v2[2])
+    # 12 float32 per facet (normal + 3 vertices) then a uint16 attribute count.
+    payload = np.zeros((len(tris), 12), dtype=np.float32)
+    payload[:, 0:3] = normals
+    payload[:, 3:6] = v0
+    payload[:, 6:9] = v1
+    payload[:, 9:12] = v2
 
-            f.write(struct.pack('<ffff', float(nx_val), float(ny_val), float(nz_val), 0.0))
-            for vertex in [vertices[i0], vertices[i1], vertices[i2]]:
-                f.write(struct.pack('<ffff', float(vertex[0]), float(vertex[1]), float(vertex[2]), 0.0))
+    facets = np.zeros((len(tris), 50), dtype=np.uint8)
+    facets[:, :48] = payload.view(np.uint8).reshape(len(tris), 48)
 
-    return str(out_path)
+    with open(pathlib.Path(output_path), "wb") as f:
+        f.write(header)
+        f.write(struct.pack("<I", len(tris)))
+        f.write(facets.tobytes())
 
-
-if __name__ == "__main__":
-    settings = TerrainSettings(
-        west=-3.05, south=12.69, east=-2.95, north=12.79,
-        model_width_mm=300, model_depth_mm=300, resolution_m=64.0,
-    )
-
-    # Simulated dummy elevation grid 64x64 with slight altitude variation
-    import numpy as np
-    dummy_elevation = np.ones((64, 64)) * 100  # 100m base
-    # Add a gentle hill in the center
-    for r_idx in range(64):
-        for c_idx in range(64):
-            dist = math.sqrt(((c_idx - 32) / 32) ** 2 + ((r_idx - 32) / 32) ** 2)
-            if dist < 1:
-                dummy_elevation[r_idx, c_idx] += (1 - dist) * 20
-
-    builder = MeshBuilder(settings)
-    verts, tris = builder.build(dummy_elevation, elevation_data_available=True)
-
-    out_path = export_to_stl(verts, tris, "/tmp/test_terrain.stl")
-    print(f"Wrote {out_path}")
-    import os
-    size_bytes = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-    print(f"File size: {size_bytes} bytes")
+    return str(output_path)

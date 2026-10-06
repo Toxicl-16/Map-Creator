@@ -3,20 +3,18 @@
 Endpoints:
     GET  /api/health              -- health check
     POST /api/geocode             -- resolve place name to bounding box
-    POST /api/settings            -- validate & return terrain generation settings
-    POST /api/generate/stl        -- generate STL from current selection (blocking)
-    GET  /api/download/{token}    -- stream generated binary STL file
+    POST /api/generate/stl        -- build, export and validate an STL model
+    GET  /api/download/{token}    -- download the generated binary STL
 
-Data sources:
-    Elevation  : SRTM GL1 30m hgt tiles (no API key required)
-    Geocoding  : Nominatim + Photon fallback (ODbL, no API key required)
-    Vector     : Overpass API for roads/buildings (ODbL, no API key required)
+Data sources (all keyless):
+    Elevation  : SRTM GL1 hgt tiles
+    Geocoding  : Nominatim (OpenStreetMap)
+    Vector     : Overpass API for roads / building footprints
 """
 
 import asyncio
 import logging
-import math
-import shutil
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -24,20 +22,27 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.models import GeoBounds
 
 logger = logging.getLogger(__name__)
 
-# Paths (relative to project root)
-DATA_DIR = Path("data")  # shared cache for elevation / vector tiles
-DOWNLOADS_DIR = DATA_DIR.joinpath("downloads")  # generated STL output
-OUTPUT_DIR = Path("output")
+ROOT = Path(__file__).resolve().parents[2]
+STATIC_DIR = ROOT / "frontend" / "static"
+DATA_DIR = ROOT / "data"
+DOWNLOADS_DIR = DATA_DIR / "downloads"
 
 MAX_MODEL_WIDTH_MM = 600
 MAX_MODEL_DEPTH_MM = 600
+DOWNLOAD_TTL_SECONDS = 3600
+
+# Overpass and Nominatim both ask for an identifying User-Agent.
+DEFAULT_USER_AGENT = "Map-Creator terrain model generator (https://github.com/local/map-creator)"
 
 
 # -- Pydantic models ----------------------------------------------------------
@@ -45,107 +50,126 @@ MAX_MODEL_DEPTH_MM = 600
 
 class GeoQuery(BaseModel):
     """Search query: a place name or address."""
-    q: str = Field(..., min_length=1, description="Search string", examples=["San Francisco, CA"])
+
+    q: str = Field(..., min_length=1, examples=["Yosemite Valley, CA"])
 
     @field_validator("q")
     @classmethod
     def strip_query(cls, v: str) -> str:
-        return v.strip()
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("search query must not be blank")
+        return cleaned
 
 
 class BoundingBox(BaseModel):
     """Geographic bounding box (WGS84 degrees)."""
+
     west: float = Field(..., ge=-180, le=180)
     south: float = Field(..., ge=-90, le=90)
     east: float = Field(..., ge=-180, le=180)
     north: float = Field(..., ge=-90, le=90)
 
-    @field_validator("west", "east")
-    @classmethod
-    def validate_lon(cls, v):
-        if not (-180 <= v <= 180):
-            raise ValueError("longitude must be between -180 and 180")
-        return v
+    @model_validator(mode="after")
+    def check_extent(self):
+        if self.west >= self.east:
+            raise ValueError("west must be less than east")
+        if self.south >= self.north:
+            raise ValueError("south must be less than north")
+        return self
 
-    @field_validator("south", "north")
-    @classmethod
-    def validate_lat(cls, v):
-        if not (-90 <= v <= 90):
-            raise ValueError("latitude must be between -90 and -90")
-        return v
+    @property
+    def center_lat(self) -> float:
+        return (self.south + self.north) / 2.0
 
-
-class GridSize(BaseModel):
-    """Grid resolution parameters."""
-    rows: int = Field(..., ge=32, le=1024)
-    cols: int = Field(..., ge=32, le=1024)
-
-    @field_validator("rows", "cols")
-    @classmethod
-    def validate_positive(cls, v):
-        if v < 32:
-            raise ValueError("minimum grid size is 32")
-        return v
+    @property
+    def center_lon(self) -> float:
+        return (self.west + self.east) / 2.0
 
 
 class CreateMeshRequest(BaseModel):
-    """Parameters for generating a terrain STL mesh."""
+    """Parameters for generating a terrain STL model."""
+
     # Geographic bounds
     west: float = Field(-122.5, ge=-180, le=180)
     south: float = Field(37.7, ge=-90, le=90)
     east: float = Field(-122.4, ge=-180, le=180)
     north: float = Field(37.8, ge=-90, le=90)
 
-    # Model dimensions in mm
-    model_width_mm: float = Field(300.0, gt=0, le=600)
-    model_depth_mm: float = Field(300.0, gt=0, le=600)
+    # Physical model dimensions (mm)
+    model_width_mm: float = Field(300.0, gt=0, le=MAX_MODEL_WIDTH_MM)
+    model_depth_mm: float = Field(300.0, gt=0, le=MAX_MODEL_DEPTH_MM)
 
-    # Elevation grid resolution (meters per cell)
-    resolution_m: float = Field(50.0, gt=5, le=128)
+    # Elevation grid resolution (metres per cell)
+    resolution_m: float = Field(50.0, ge=10, le=128)
 
     # Height mapping
     min_altitude_mm: float = Field(2.0, ge=0, lt=100)
     max_altitude_mm: float = Field(50.0, gt=0, lt=1000)
     vertical_exaggeration: float = Field(1.0, gt=0, le=50)
+    smoothing_passes: int = Field(2, ge=0, le=8)
 
     # Base plate
     base_thickness_mm: float = Field(3.0, ge=0, lt=100)
     base_extension_mm: float = Field(0.0, ge=0, lt=100)
 
-    # Feature inclusion toggles
+    # Feature toggles
     include_roads: bool = False
     include_buildings: bool = False
     include_contours: bool = False
+    road_width_mm: float = Field(1.6, gt=0, le=20)
+    road_height_mm: float = Field(1.2, gt=0, le=20)
+    building_height_mm: float = Field(6.0, gt=0, le=50)
+    contour_interval_m: float = Field(50.0, gt=0, le=2000)
+    contour_thickness_mm: float = Field(0.6, gt=0, le=10)
+    contour_height_mm: float = Field(0.8, ge=-10, le=10)
+    contours_engraved: bool = False
 
-    @field_validator("min_altitude_mm")
-    @classmethod
-    def validate_min_height(cls, v: float, info):
-        if hasattr(info, "data"):
-            max_h = info.data.get("max_altitude_mm", 100)
-            if v >= max_h:
-                raise ValueError("min_altitude must be less than max_altitude")
-        return v
+    @model_validator(mode="after")
+    def check_request(self):
+        if self.west >= self.east or self.south >= self.north:
+            raise ValueError("selection must have west < east and south < north")
+        if self.min_altitude_mm >= self.max_altitude_mm:
+            raise ValueError("min_altitude_mm must be less than max_altitude_mm")
 
-    @field_validator("model_width_mm", "model_depth_mm")
-    @classmethod
-    def validate_model_size(cls, v, info):
-        if hasattr(info, "data"):
-            if not (0 < v <= MAX_MODEL_WIDTH_MM):
-                raise ValueError(f"must be between 0 and {MAX_MODEL_WIDTH_MM}")
-        return v
+        from app.utils.projection import bounds_to_meters
+
+        width_m, height_m = bounds_to_meters(self.to_geo_bounds())
+        if width_m <= 0 or height_m <= 0:
+            raise ValueError("selection has no ground area")
+        if width_m < 50 or height_m < 50:
+            raise ValueError("selection is too small to mesh (minimum 50 m across)")
+        if width_m > 60_000 or height_m > 60_000:
+            raise ValueError("selection is too large (maximum 60 km across)")
+        return self
+
+    def to_geo_bounds(self) -> GeoBounds:
+        return GeoBounds(
+            west=self.west, south=self.south, east=self.east, north=self.north
+        )
 
 
 class GeocodeResponse(BaseModel):
     """Result of a geocoding lookup."""
+
     display_name: str
     center_lat: float
     center_lon: float
-    bounds: BoundingBox | None = None
+    bounds: BoundingBox
     confidence: float = 0.0
+
+
+class FeatureStats(BaseModel):
+    """How much of each optional feature ended up in the heightfield."""
+
+    roads: int = 0
+    buildings: int = 0
+    contours: int = 0
 
 
 class MeshInfo(BaseModel):
     """Metadata about a generated mesh (not the binary data)."""
+
     token: str
     vertices: int
     triangles: int
@@ -155,258 +179,543 @@ class MeshInfo(BaseModel):
     file_size_bytes: int
     duration_ms: float
     bbox: BoundingBox
+    validation: dict
+    elevation: dict
+    features: FeatureStats
+    requested_features: list[str] = []
+    ground_area_m: float = 0.0
 
 
-# -- App lifespan ---------------------------------------------------------------
+class JobAccepted(BaseModel):
+    """Acknowledgement that a generation job has started."""
+
+    job_id: str
+    token: str
+    status_url: str
+    stages: list[str]
+
+
+class ProgressResponse(BaseModel):
+    """Live progress for a generation job."""
+
+    job_id: str
+    stage: Optional[str] = None
+    message: str = ""
+    stages: list[str] = []
+    completed: int = 0
+    percent: int = 0
+    done: bool = False
+    error: Optional[str] = None
+    result: Optional[dict] = None
+
+
+class PipelineError(Exception):
+    """A failure that should be reported to the user, not as a 500."""
+
+
+class Job:
+    """Tracks the real state of one background generation run."""
+
+    def __init__(self, token: str, stages: list[str]):
+        self.token = token
+        self.stages = list(stages)
+        self.stage: Optional[str] = None
+        self.message = "Queued"
+        self.completed = 0
+        self.done = False
+        self.error: Optional[str] = None
+        self.result: Optional[dict] = None
+        self.created = time.time()
+        self.history: list[str] = []
+
+    def enter(self, stage: str, message: str) -> None:
+        """Mark *stage* as started."""
+        self.stage = stage
+        self.message = message
+        self.history.append(stage)
+
+    def complete(self, stage: str, message: str) -> None:
+        """Mark *stage* as finished and advance the counter."""
+        self.completed += 1
+        self.stage = stage
+        self.message = message
+
+    def fail(self, message: str) -> None:
+        self.error = message
+        self.message = message
+
+
+# In-memory job registry. Entries are small and short-lived.
+_JOBS: dict[str, Job] = {}
+_TASKS: dict[str, asyncio.Task] = {}
+
+
+# -- App lifespan -------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Ensure data directories exist on startup and clean temp files."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    """Prepare data directories and prune expired downloads on startup."""
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Cleanup stale downloads (older than 1 hour) — prevent disk fill
     asyncio.create_task(_cleanup_old_downloads())
-
     logger.info("Map-Creator starting up")
     yield
     logger.info("Map-Creator shutting down")
 
 
-async def _cleanup_old_downloads():
-    """Remove download files older than ONE_HOUR_SECONDS."""
-    ONE_HOUR_SECONDS = 3600
-    import os
-
+def _prune_downloads(max_age_seconds: float = DOWNLOAD_TTL_SECONDS) -> int:
+    """Delete expired STLs and finished jobs. Returns files removed."""
     now = time.time()
-    if not DOWNLOADS_DIR.exists():
-        return
-    for f in DOWNLOADS_DIR.iterdir():
-        age = now - f.stat().st_mtime
-        if age > ONE_HOUR_SECONDS:
-            f.unlink(missing_ok=True)
+    cutoff = now - max_age_seconds
+    removed = 0
 
-# -- App instance ---------------------------------------------------------------
+    if DOWNLOADS_DIR.is_dir():
+        for path in DOWNLOADS_DIR.glob("*.stl"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                logger.debug("Could not remove %s", path, exc_info=True)
 
+    for token, job in list(_JOBS.items()):
+        if now - job.created > max_age_seconds:
+            _JOBS.pop(token, None)
+
+    return removed
+
+
+async def _cleanup_old_downloads() -> None:
+    """Periodically prune expired downloads for the lifetime of the app."""
+    try:
+        while True:
+            await asyncio.sleep(600)
+            removed = _prune_downloads()
+            if removed:
+                logger.info("Pruned %d expired download(s)", removed)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - background task must never crash
+        logger.debug("Download cleanup stopped", exc_info=True)
+
+
+# -- App instance -------------------------------------------------------------
 
 app = FastAPI(
     title="Map-Creator",
     description="Terrain model generator — select a location, generate an STL for 3D printing.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
-# CORS: allow localhost frontend during development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten before production
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-
-def _bbox_width_metres(west, east, lat_mid):
-    """Return the approximate west-east ground distance in metres at the given latitude."""
-    return abs(east - west) * 111_000.0 * math.cos(math.radians(lat_mid))
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def _bbox_height_metres(south, north):
-    """Return the approximate south-north ground distance in metres."""
-    return (north - south) * 111_320.0
+# -- Helpers ------------------------------------------------------------------
 
 
-# ---- Endpoint: health check -----------------------------------------------
-
-@app.get("/api/health", tags=["system"])
-async def health_check():
-    return {"ok": True, "service": "map-creator", "status": "running"}
+def _user_agent() -> str:
+    return os.environ.get("NOMINATIM_USER_AGENT", DEFAULT_USER_AGENT)
 
 
-# ---- Endpoint: geocode ----------------------------------------------------
+def _bbox_from_list(values) -> Optional[BoundingBox]:
+    """Convert a Nominatim ``boundingbox`` array to a :class:`BoundingBox`.
 
-@app.post("/api/geocode", response_model=GeocodeResponse, tags=["geocoding"])
-async def geocode_endpoint(payload: GeoQuery):
-    """Resolve a place name or address to geographic coordinates."""
-    import os
-    from app.geospatial.providers.geocoding import NominatimClient
-
-    user_agent = os.environ.get("NOMINATIM_USER_AGENT", "Map-Creator <support@example.com>")
-    nominatim = NominatimClient(user_agent=user_agent)
-
-    result = None
+    Nominatim orders the array ``[south, north, west, east]``.
+    """
+    if not values or len(values) < 4:
+        return None
     try:
-        search_result = await nominatim.search(payload.q, limit=1)
-        if search_result is not None and hasattr(search_result, "lat"):
-            # SearchResult is a dataclass from geocoding.py line 28-35:
-            # bounding_box stores [south, west, north, east]
-            result = {
-                "lat": float(search_result.lat),
-                "lon": float(search_result.lon),
-                "display_name": search_result.display_name or payload.q,
-                "boundingbox": [float(b) for b in (search_result.bounding_box or [])],
-            }
-    except Exception as exc:
-        logger.warning("Nominatim/Photon search failed for '%s': %s", payload.q, exc)
+        south, north, west, east = (float(v) for v in values[:4])
+        return BoundingBox(west=west, south=south, east=east, north=north)
+    except (TypeError, ValueError):
+        return None
 
-    if not result or "lat" not in (result or {}):
-        # Fallback: safe default coordinates
-        return GeocodeResponse(
-            display_name=payload.q,
-            center_lat=37.7749, center_lon=-122.4194,
-            confidence=0.0,
-        )
 
-    bounds_list = result.get("boundingbox") or []
-    bbox = None
-    if isinstance(bounds_list, list) and len(bounds_list) >= 4:
-        try:
-            # Nominatim bounding_box order: [south, west, north, east]
-            bbox = BoundingBox(
-                west=float(bounds_list[1]), north=float(bounds_list[2]),
-                east=float(bounds_list[3]), south=float(bounds_list[0]),
-            )
-        except (ValueError, TypeError):
-            pass
+def _default_box(lat: float, lon: float, size_m: float = 1500.0) -> BoundingBox:
+    """A box around a point for results that carry no boundary of their own."""
+    from app.utils.projection import meters_to_degrees
 
-    return GeocodeResponse(
-        display_name=result.get("display_name", payload.q),
-        center_lat=result.get("lat", 37.7749),
-        center_lon=result.get("lon", -122.4194),
-        bounds=bbox, confidence=0.5,
+    deg_lon, deg_lat = meters_to_degrees(size_m, size_m, lat)
+    return BoundingBox(
+        west=lon - deg_lon / 2,
+        east=lon + deg_lon / 2,
+        south=lat - deg_lat / 2,
+        north=lat + deg_lat / 2,
     )
 
 
-# ---- Endpoint: generate STL -----------------------------------------------
+# -- Endpoints ----------------------------------------------------------------
 
-@app.post("/api/generate/stl", response_model=MeshInfo, tags=["mesh"])
-async def generate_mesh(payload: CreateMeshRequest):
-    """Generate a terrain mesh and return metadata (not binary data)."""
-    import time as _time
 
-    start_ms = _time.time() * 1000
-    token = uuid.uuid4().hex[:12]
-    out_file = DOWNLOADS_DIR / f"{token}.stl"
+@app.get("/api/health", tags=["system"])
+async def health_check():
+    return {
+        "ok": True,
+        "service": "map-creator",
+        "status": "running",
+        "version": app.version,
+    }
+
+
+@app.get("/", include_in_schema=False)
+async def index():
+    """Serve the single-page frontend."""
+    index_file = STATIC_DIR / "index.html"
+    if not index_file.is_file():
+        raise HTTPException(status_code=404, detail="frontend is not installed")
+    return FileResponse(str(index_file))
+
+
+@app.post("/api/geocode", response_model=GeocodeResponse, tags=["geocoding"])
+async def geocode_endpoint(payload: GeoQuery):
+    """Resolve a place name to coordinates and a selectable bounding box."""
+    from app.geospatial.providers.geocoding import NominatimClient
+
+    client = NominatimClient(user_agent=_user_agent())
 
     try:
-        from app.services.terrain import TerrainSettings, MeshBuilder
+        result = await client.search(payload.q, limit=1)
+    except Exception as exc:
+        logger.warning("Geocoding failed for %r: %s", payload.q, exc)
+        raise HTTPException(status_code=502, detail="location search is unavailable") from exc
 
-        ts = TerrainSettings(
-            west=payload.west, south=payload.south,
-            east=payload.east, north=payload.north,
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f'no location found for "{payload.q}"'
+        )
+
+    lat = float(result.lat)
+    lon = float(result.lon)
+
+    try:
+        bbox = _bbox_from_list(result.bounding_box) or _default_box(lat, lon)
+    except ValueError:
+        bbox = _default_box(lat, lon)
+
+    return GeocodeResponse(
+        display_name=result.display_name or payload.q,
+        center_lat=lat,
+        center_lon=lon,
+        bounds=bbox,
+        confidence=0.9 if result.bounding_box else 0.5,
+    )
+
+
+@app.post("/api/generate/stl", response_model=JobAccepted, status_code=202, tags=["mesh"])
+async def generate_mesh(payload: CreateMeshRequest):
+    """Start a generation job.
+
+    A full run takes several seconds (SRTM downloads, Overpass queries, mesh
+    assembly), so the work happens in the background and reports genuine stage
+    transitions through ``GET /api/progress/{token}``. Poll until ``done``,
+    then download ``token``.
+    """
+    token = uuid.uuid4().hex[:12]
+
+    stages = ["elevation"]
+    if payload.include_roads or payload.include_buildings or payload.include_contours:
+        stages.append("features")
+    stages += ["mesh", "export", "validate"]
+
+    job = Job(token=token, stages=stages)
+    _JOBS[token] = job
+
+    task = asyncio.create_task(_run_pipeline(job, payload))
+    _TASKS[token] = task
+    task.add_done_callback(lambda _t, key=token: _TASKS.pop(key, None))
+
+    return JobAccepted(
+        job_id=token,
+        token=token,
+        status_url=f"/api/progress/{token}",
+        stages=stages,
+    )
+
+
+@app.get("/api/progress/{token}", response_model=ProgressResponse, tags=["mesh"])
+async def generation_progress(token: str):
+    """Report real stage transitions for a running generation job."""
+    if not token.isalnum():
+        raise HTTPException(status_code=400, detail="invalid token")
+
+    job = _JOBS.get(token)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown job")
+
+    percent = round(100 * job.completed / len(job.stages)) if job.stages else 0
+    return ProgressResponse(
+        job_id=job.token,
+        stage=job.stage,
+        message=job.message,
+        stages=job.stages,
+        completed=job.completed,
+        percent=100 if job.done else percent,
+        done=job.done,
+        error=job.error,
+        result=job.result,
+    )
+
+
+# -- Pipeline -----------------------------------------------------------------
+
+
+async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
+    """Run a generation job, recording each stage as it actually completes."""
+    started = time.perf_counter()
+    token = job.token
+
+    try:
+        from app.geospatial.providers.elevation import (
+            ElevationUnavailableError,
+            SRTMTileFetcher,
+        )
+        from app.services.features import (
+            ModelTransform,
+            build_buildings,
+            build_contours,
+            build_roads,
+        )
+        from app.services.terrain import (
+            MeshBuilder,
+            TerrainGenerationError,
+            TerrainSettings,
+            export_to_stl,
+        )
+        from app.services.validation import validate_stl_file
+        from app.utils.projection import bounds_to_meters
+
+        bounds = payload.to_geo_bounds()
+        width_m, height_m = bounds_to_meters(bounds)
+
+        settings = TerrainSettings(
+            west=bounds.west,
+            south=bounds.south,
+            east=bounds.east,
+            north=bounds.north,
             model_width_mm=payload.model_width_mm,
             model_depth_mm=payload.model_depth_mm,
             resolution_m=payload.resolution_m,
             min_altitude_mm=payload.min_altitude_mm,
             max_altitude_mm=payload.max_altitude_mm,
             vertical_exaggeration=payload.vertical_exaggeration,
+            smoothing_passes=payload.smoothing_passes,
             base_thickness_mm=payload.base_thickness_mm,
             base_extension_mm=payload.base_extension_mm,
+            include_roads=payload.include_roads,
+            include_buildings=payload.include_buildings,
+            include_contours=payload.include_contours,
+            road_width_mm=payload.road_width_mm,
+            road_height_mm=payload.road_height_mm,
+            building_height_mm=payload.building_height_mm,
+            contour_interval_m=payload.contour_interval_m,
+            contour_thickness_mm=payload.contour_thickness_mm,
+            contour_height_mm=payload.contour_height_mm,
+            contours_engraved=payload.contours_engraved,
         )
 
-        # Fetch elevation data (blocking — SRTM tiles)
-        from app.geospatial.providers.elevation import SRTMTileFetcher
+        # -- Stage 1: elevation -------------------------------------------
+        job.enter("elevation", "Downloading SRTM elevation tiles…")
+        try:
+            elev_grid = await SRTMTileFetcher.fetch_elevation(
+                west=bounds.west,
+                south=bounds.south,
+                east=bounds.east,
+                north=bounds.north,
+                resolution_m=payload.resolution_m,
+            )
+        except ElevationUnavailableError as exc:
+            raise PipelineError(str(exc)) from exc
+        except ValueError as exc:
+            raise PipelineError(str(exc)) from exc
 
-        fetcher = SRTMTileFetcher()
-        elev_grid = await fetcher.fetch_elevation(
-            west=payload.west, south=payload.south,
-            east=payload.east, north=payload.north,
-        )
-        if elev_grid is None:
-            raise HTTPException(status_code=502, detail="Unable to fetch elevation tiles for the selected area.")
+        elev_grid = _finite(elev_grid)
+        builder = MeshBuilder(settings)
+        surface = builder.surface_of(elev_grid)
+        job.complete("elevation", f"Elevation ready ({elev_grid.shape[0]}×{elev_grid.shape[1]} samples)")
 
-        builder = MeshBuilder(ts)
-        vertices, triangles = builder.build(elev_grid, elevation_data_available=True)
+        # -- Stage 2: map features ----------------------------------------
+        roads = buildings = contours = None
+        if "features" in job.stages:
+            job.enter("features", "Loading roads and buildings from OpenStreetMap…")
+            transform = ModelTransform.create(
+                bounds, payload.model_width_mm, payload.model_depth_mm
+            )
 
-        out_path = await export_stl_mesh(vertices, triangles, str(out_file))
-        file_size = out_file.stat().st_size if out_file.exists() else 0
+            if payload.include_roads:
+                ways = await _fetch_roads(bounds)
+                roads = build_roads(
+                    ways,
+                    transform,
+                    surface,
+                    width_mm=settings.road_width_mm,
+                    height_mm=settings.road_height_mm,
+                    min_width_mm=settings.road_width_mm / 2,
+                    smoothing_passes=settings.smoothing_passes,
+                )
+                logger.info(
+                    "Rasterised %d road cell(s) from %d way(s)",
+                    int(roads["mask"].sum()), len(ways),
+                )
 
-        elapsed_ms = _time.time() * 1000 - start_ms
-        height_range = payload.max_altitude_mm - payload.min_altitude_mm
+            if payload.include_buildings:
+                ways = await _fetch_buildings(bounds)
+                buildings = build_buildings(
+                    ways,
+                    transform,
+                    surface,
+                    height_mm=settings.building_height_mm,
+                    min_height_mm=settings.building_height_mm / 2,
+                    footprint_scale=settings.building_footprint_scale,
+                )
+                logger.info(
+                    "Rasterised %d building cell(s) from %d way(s)",
+                    int(buildings["mask"].sum()), len(ways),
+                )
 
-        return MeshInfo(
-            token=token, vertices=len(vertices), triangles=len(triangles),
-            width_mm=payload.model_width_mm, depth_mm=payload.model_depth_mm,
-            height_range_mm=height_range, file_size_bytes=file_size,
-            duration_ms=round(elapsed_ms, 1),
-            bbox=BoundingBox(west=payload.west, south=payload.south,
-                             east=payload.east, north=payload.north),
-        )
+            if payload.include_contours:
+                contours = build_contours(
+                    elev_grid,
+                    width_mm=payload.model_width_mm,
+                    depth_mm=payload.model_depth_mm,
+                    interval_m=settings.contour_interval_m,
+                    thickness_mm=settings.contour_thickness_mm,
+                    height_mm=settings.contour_height_mm,
+                    engraved=settings.contours_engraved,
+                )
+                logger.info("Rasterised %d contour cell(s)", int(contours["mask"].sum()))
 
-    except HTTPException:
-        raise
-    except ImportError as exc:
-        raise HTTPException(status_code=500, detail=f"Missing import: {exc}")
-    except Exception as exc:
-        logger.exception("Mesh generation failed for token=%s", token)
-        raise HTTPException(status_code=500, detail=str(exc))
+            job.complete("features", "Map features loaded")
 
+        # -- Stage 3: mesh -------------------------------------------------
+        job.enter("mesh", "Building terrain surface and solid…")
+        try:
+            vertices, triangles, _surface, stats = builder.build_with_features(
+                elev_grid, roads=roads, buildings=buildings, contours=contours
+            )
+        except TerrainGenerationError as exc:
+            raise PipelineError(str(exc)) from exc
+        job.complete("mesh", f"Mesh assembled ({len(triangles):,} triangles)")
 
-# ---- Endpoint: download STL (binary) --------------------------------------
+        # -- Stage 4: export ------------------------------------------------
+        job.enter("export", "Writing binary STL…")
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        out_file = DOWNLOADS_DIR / f"{token}.stl"
+        try:
+            export_to_stl(vertices, triangles, out_file)
+        except OSError as exc:
+            raise PipelineError("could not write the STL file") from exc
+        job.complete("export", "STL written")
+
+        # -- Stage 5: validate ----------------------------------------------
+        job.enter("validate", "Checking the mesh is watertight…")
+        report = validate_stl_file(out_file, len(triangles))
+        if not report.watertight or not report.manifold:
+            out_file.unlink(missing_ok=True)
+            logger.error("Generated mesh failed validation: %s", report.issues)
+            raise PipelineError(
+                "the generated mesh did not pass validation: " + "; ".join(report.issues)
+            )
+
+        job.result = MeshInfo(
+            token=token,
+            vertices=report.vertices,
+            triangles=report.triangles,
+            width_mm=report.bbox_mm[0],
+            depth_mm=report.bbox_mm[1],
+            height_range_mm=report.bbox_mm[2],
+            file_size_bytes=out_file.stat().st_size,
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            bbox=BoundingBox(
+                west=bounds.west,
+                south=bounds.south,
+                east=bounds.east,
+                north=bounds.north,
+            ),
+            validation=report.as_dict(),
+            elevation={
+                "min_m": round(float(elev_grid.min()), 1),
+                "max_m": round(float(elev_grid.max()), 1),
+                "rows": int(elev_grid.shape[0]),
+                "cols": int(elev_grid.shape[1]),
+            },
+            features=FeatureStats(**stats),
+            requested_features=[
+                name
+                for name, wanted in (
+                    ("roads", payload.include_roads),
+                    ("buildings", payload.include_buildings),
+                    ("contours", payload.include_contours),
+                )
+                if wanted
+            ],
+            ground_area_m=round(max(width_m, height_m), 1),
+        ).model_dump()
+        job.complete("validate", "Validation passed")
+
+    except PipelineError as exc:
+        job.fail(str(exc))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Generation job %s failed", token)
+        job.fail(f"unexpected error: {exc}")
+    finally:
+        job.done = True
+
 
 @app.get("/api/download/{token}", tags=["mesh"])
 async def download_stl(token: str):
-    """Stream the generated STL file back to the client."""
+    """Download a previously generated binary STL file."""
+    if not token.isalnum():
+        raise HTTPException(status_code=400, detail="invalid download token")
+
     stl_file = DOWNLOADS_DIR / f"{token}.stl"
-    if not stl_file.exists():
-        raise HTTPException(status_code=404, detail="Mesh file not found or expired.")
+    if not stl_file.is_file():
+        raise HTTPException(status_code=404, detail="model file not found or expired")
 
     return Response(
         media_type="application/octet-stream",
-        headers={"Content-Disposition": 'attachment; filename="terrain_model.stl"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="terrain-{token}.stl"',
+            "Content-Length": str(stl_file.stat().st_size),
+        },
         content=stl_file.read_bytes(),
     )
 
 
-# ---- Internal helpers -----------------------------------------------------
+# -- Pipeline helpers ---------------------------------------------------------
 
 
-async def get_settings():
-    """Load environment settings (lazy, single-call)."""
-    from dotenv import load_dotenv
+def _finite(grid: np.ndarray) -> np.ndarray:
+    """Replace elevation voids with a continuous surface."""
+    from app.geospatial.providers.elevation import ElevationDataProcessor
 
-    # Resolve .env relative to project root
-    env_path = Path(__file__).resolve().parents[2] / ".env"
-    load_dotenv(env_path, override=False)
-
-    class _Settings:
-        pass
-
-    s = _Settings()
-    s.open_topography_key = ""  # optional — set OPEN_TOPOGRAPHY_API_KEY
-    s.nominatim_user_agent = "Map-Creator <your@email>"
-    user_agent = __import__("os").environ.get("NOMINATIM_USER_AGENT", s.nominatim_user_agent)
-    if user_agent:
-        s.nominatim_user_agent = user_agent
-    return s
+    voids = int(np.isnan(grid).sum())
+    if voids:
+        logger.warning("Elevation grid contained %d void cell(s)", voids)
+        grid = ElevationDataProcessor.fill_nan(grid)
+    return grid
 
 
-async def export_stl_mesh(vertices, triangles, output_path: str):
-    """Write vertices/triangles to a binary STL file."""
-    import struct
-    import numpy
-    from pathlib import Path as _P
+async def _fetch_roads(bounds: GeoBounds) -> list:
+    from app.geospatial.providers.vector import RoadFeatureProvider
 
-    out = _P(output_path)
-    header_str = "Terrain mesh generated by Map-Creator" + "\x00" * (80 - len("Terrain mesh generated by Map-Creator"))
-    n_tri = len(triangles)
+    provider = RoadFeatureProvider(user_agent=_user_agent())
+    return await provider.fetch_roads(bounds.west, bounds.south, bounds.east, bounds.north)
 
-    data = header_str.encode()[:80] + struct.pack("<I", n_tri)
-    for i0, i1, i2 in triangles:
-        v0 = numpy.asarray(vertices[i0]) if not isinstance(vertices[i0], numpy.ndarray) else vertices[i0]
-        v1 = numpy.asarray(vertices[i1]) if not isinstance(vertices[i1], numpy.ndarray) else vertices[i1]
-        v2 = numpy.asarray(vertices[i2]) if not isinstance(vertices[i2], numpy.ndarray) else vertices[i2]
 
-        # Unnormalized face normal
-        nx_val = (v0[1] - v1[1]) * (v0[2] - v2[2]) - (v0[2] - v1[2]) * (v0[0] - v2[0])
-        ny_val = (v0[2] - v1[2]) * (v0[0] - v2[0]) - (v0[0] - v1[0]) * (v0[1] - v2[1])
-        nz_val = (v0[0] - v1[0]) * (v0[1] - v2[1]) - (v0[1] - v1[1]) * (v0[2] - v2[2])
+async def _fetch_buildings(bounds: GeoBounds) -> list:
+    from app.geospatial.providers.vector import BuildingFeatureProvider
 
-        data += struct.pack("<ffff", float(nx_val), float(ny_val), float(nz_val), 0.0)
-        for vert in [vertices[i0], vertices[i1], vertices[i2]]:
-            arr = numpy.asarray(vert) if not isinstance(vert, numpy.ndarray) else vert
-            data += struct.pack("<ffff", float(arr[0]), float(arr[1]), float(arr[2]), 0.0)
-
-    out.write_bytes(data)
-    return out
+    provider = BuildingFeatureProvider(user_agent=_user_agent())
+    return await provider.fetch_buildings(
+        bounds.west, bounds.south, bounds.east, bounds.north
+    )

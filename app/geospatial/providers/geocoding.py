@@ -15,7 +15,7 @@ Data copyright © OpenStreetMap contributors, under ODbL license.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 

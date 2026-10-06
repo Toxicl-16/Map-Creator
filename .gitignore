@@ -54,6 +54,11 @@ downloads/
 *.stl
 output/
 
+# Local scratch: elevation tile cache, QA runs, agent context
+.qa/
+.opencode-context.md
+.worktrees/
+
 # Logs
 *.log
 

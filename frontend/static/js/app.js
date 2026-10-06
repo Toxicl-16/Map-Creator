@@ -369,28 +369,54 @@
     if (event.target.closest && event.target.closest(".leaflet-control")) return;
 
     var handleName = event.target.getAttribute && event.target.getAttribute("data-handle");
-    var container = map.getContainer();
-    var point = map.mouseEventToContainerPoint(event);
-    var latLng = map.containerPointToLatLng(point);
+    var isHandle = !!handleName;
+    var isSelectionTarget = isHandle || (event.target.closest && event.target.closest(".sel-box"));
 
-    drag = {
-      pointerId: event.pointerId,
-      handle: handleName || null,
-      origin: latLng,
-      startBounds: selection ? Object.assign({}, selection) : null,
-      moved: false,
-      mode: selection ? (handleName ? "resize" : "move") : "create"
-    };
-
-    if (drag.mode === "create") {
-      // A click without a drag clears the selection.
-      drag.startBounds = { west: latLng.lng, east: latLng.lng, south: latLng.lat, north: latLng.lat };
+    // Only intercept when creating a new selection, or interacting with selection UI (handles or interior).
+    if (!selection && !isHandle) {
+      // Start creating selection from this point
+      var container = map.getContainer();
+      var point = map.mouseEventToContainerPoint(event);
+      var latLng = map.containerPointToLatLng(point);
+      drag = {
+        pointerId: event.pointerId,
+        handle: null,
+        origin: latLng,
+        startBounds: { west: latLng.lng, east: latLng.lng, south: latLng.lat, north: latLng.lat },
+        moved: false,
+        mode: "create"
+      };
       renderSelection();
+      container.setPointerCapture(event.pointerId);
+      container.classList.add("leaflet-dragging");
+      event.preventDefault();
+      return;
     }
 
-    container.setPointerCapture(event.pointerId);
-    container.classList.add("leaflet-dragging");
-    event.preventDefault();
+    if (selection && isSelectionTarget) {
+      var container2 = map.getContainer();
+      var point2 = map.mouseEventToContainerPoint(event);
+      var latLng2 = map.containerPointToLatLng(point2);
+      drag = {
+        pointerId: event.pointerId,
+        handle: handleName || null,
+        origin: latLng2,
+        startBounds: Object.assign({}, selection),
+        moved: false,
+        mode: handleName ? "resize" : "move"
+      };
+      container2.setPointerCapture(event.pointerId);
+      container2.classList.add("leaflet-dragging");
+      event.preventDefault();
+      return;
+    }
+
+    // Clicked outside selection while selection exists -> let Leaflet pan, and optionally clear selection? Don't intercept.
+    if (selection && !isSelectionTarget) {
+      setSelection(null);
+      // Don't prevent default - allow map to pan if user drags, or just clear.
+      return;
+    }
   }
 
   function onPointerMove(event) {

@@ -5,7 +5,7 @@ aiohttp>=3.10.0
 numpy>=2.0.0
 
 # STL validation
-pystl>=0.3.0
+pystl>=0.1.0
 
 # Data processing
 rasterio>=1.4.0  # optional: if using raster elevation tiles

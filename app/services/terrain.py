@@ -62,7 +62,7 @@ class TerrainSettings:
     road_min_width_mm: float = 0.8
     building_height_mm: float = 6.0
     building_min_height_mm: float = 3.0
-    building_footprint_scale: float = 1.0
+    building_footprint_scale: float = 1.05
     contour_interval_m: float = 50.0
     contour_major_interval_m: float = 250.0
     contour_thickness_mm: float = 0.6

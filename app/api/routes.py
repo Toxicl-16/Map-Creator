@@ -118,9 +118,9 @@ class CreateMeshRequest(BaseModel):
     include_buildings: bool = False
     include_contours: bool = False
     road_width_mm: float = Field(3.0, gt=0, le=20)
-    road_height_mm: float = Field(1.2, gt=0, le=20)
-    building_height_mm: float = Field(6.0, gt=0, le=50)
-    contour_interval_m: float = Field(50.0, gt=0, le=2000)
+    road_height_mm: float = Field(2.0, gt=0, le=20)
+    building_height_mm: float = Field(12.0, gt=0, le=50)
+    contour_interval_m: float = Field(20.0, gt=0, le=2000)
     contour_thickness_mm: float = Field(0.6, gt=0, le=10)
     contour_height_mm: float = Field(0.8, ge=-10, le=10)
     contours_engraved: bool = False

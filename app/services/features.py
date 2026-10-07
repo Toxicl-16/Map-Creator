@@ -347,7 +347,7 @@ def build_roads(
     mask = np.zeros((rows, cols), dtype=bool)
     z = np.full((rows, cols), -np.inf, dtype=np.float64)
 
-    radius = max(min_width_mm, width_mm) / 2.0
+    radius = max(min_width_mm, width_mm, (transform.width_mm / cols) * 0.25, (transform.depth_mm / rows) * 0.25) / 2.0
 
     for way in ways:
         nodes = _way_nodes(way)

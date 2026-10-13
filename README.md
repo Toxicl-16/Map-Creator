@@ -39,7 +39,8 @@ python -m pytest tests/ -q
 2. **Select** — drag a rectangle on the map. Drag it to move, use any of the eight
    handles to resize, or click *Use whole view*.
 3. **Configure** — physical size in millimetres, relief height range, grid detail,
-   and which map features to fold in.
+   and which map features to fold in. Road and building heights (and their
+   scaling), contour interval and contour line dimensions are all tunable.
 4. **Generate** — the backend runs five real stages and reports each one as it
    completes.
 5. **Preview** — the browser parses the exact STL the server produced and renders it
@@ -52,6 +53,18 @@ python -m pytest tests/ -q
 Terrain, skirt, base plate, roads, buildings and contour lines are all folded into a
 single millimetre heightfield, then extruded as one closed solid. That is why the
 export is always a single watertight mesh rather than several overlapping shells.
+
+Road centrelines are folded in as raised rectangular strips — a flat top with
+vertical sides — so a road reads as a clean raised line rather than a rounded
+causeway. Building footprints are extruded as flat-topped blocks with vertical
+walls. Real OSM building heights are respected *relatively* — with one
+*Height scale* control multiplying the whole layer — so a church stays taller than
+a shed without any single tower swallowing the model. The terrain itself stays
+smooth: *Elevation layers* folds the contour rings in at the layer interval (and
+refines the grid to a fine mesh so the rings curve cleanly), while *Contours*
+draws marching-squares isolines at the contour interval. Both are blended into the
+surface with the same smooth falloff, so the terrain and contour rings have no
+vertical walls.
 
 Physical coordinates use a local UTM projection, so millimetre dimensions are not
 distorted by latitude. Road and building footprints are projected with the same

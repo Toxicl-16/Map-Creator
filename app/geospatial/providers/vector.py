@@ -26,7 +26,64 @@ logger = logging.getLogger(__name__)
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
+
+# Number of full passes over the endpoint list before giving up. Public mirrors
+# frequently answer 429/500/503/504 for a moment and then recover, so a single
+# failed pass must not silently drop every road from the model.
+OVERPASS_PASSES = 3
+
+
+class OverpassUnavailableError(RuntimeError):
+    """Raised when every Overpass endpoint failed for a query."""
+
+
+# Highway classes rendered as roads. Ordered most major to most minor.
+DEFAULT_HIGHWAY_TYPES = [
+    "motorway",
+    "trunk",
+    "primary",
+    "secondary",
+    "tertiary",
+    "residential",
+    "unclassified",
+    "living_street",
+    "service",
+]
+
+
+def build_road_query(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    highway_types: Optional[List[str]] = None,
+) -> str:
+    """Build the Overpass QL that fetches road centrelines for a bounding box.
+
+    A way carries exactly one ``highway=*`` value, so consecutive tag filters
+    would be AND-ed together and match nothing. One alternation filter matches
+    every requested class in a single statement.
+    """
+    types = [
+        t
+        for t in (highway_types or DEFAULT_HIGHWAY_TYPES)
+        if t and t.replace("_", "").isalnum()
+    ]
+    if not types:
+        types = [t for t in DEFAULT_HIGHWAY_TYPES if t.replace("_", "").isalnum()]
+
+    # Only word-like class names can appear in the QL, so nothing is escaped.
+    pattern = "^(" + "|".join(types) + ")$"
+    bbox = f"({south},{west},{north},{east})"
+
+    return (
+        "[out:json][timeout:60];\n"
+        f'way["highway"~"{pattern}"]{bbox};\n'
+        "out geom;"
+    )
 
 
 class OverpassClient:
@@ -38,57 +95,57 @@ class OverpassClient:
     async def query(self, ql_string: str, timeout: float = 60.0) -> Optional[Dict]:
         """Execute an Overpass QL query and return the JSON response.
 
-        Returns None if all endpoints fail.
+        Retries the whole endpoint list a few times with a short backoff before
+        returning ``None``; transient mirror hiccups are common.
         """
-        for endpoint in OVERPASS_ENDPOINTS:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    resp = await asyncio.wait_for(
-                        session.post(
-                            endpoint,
-                            data={"data": ql_string},
-                            headers={"User-Agent": self._user_agent},
-                            timeout=aiohttp.ClientTimeout(total=timeout + 5),
-                        ),
-                        timeout=timeout + 10,
-                    )
-
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data
-                    elif resp.status in (429, 503):
-                        logger.warning(
-                            "Overpass API rate limited (%d), trying next endpoint",
-                            resp.status,
-                        )
-                        await asyncio.sleep(1)
-                    else:
-                        # Truncate the body ourselves: ClientResponse.text()
-                        # takes no size argument.
-                        body = (await resp.text())[:8000]
-                        logger.warning(
-                            "Overpass returned status %d: %s", resp.status, body
+        for attempt in range(OVERPASS_PASSES):
+            for endpoint in OVERPASS_ENDPOINTS:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        resp = await asyncio.wait_for(
+                            session.post(
+                                endpoint,
+                                data={"data": ql_string},
+                                headers={"User-Agent": self._user_agent},
+                                timeout=aiohttp.ClientTimeout(total=timeout + 5),
+                            ),
+                            timeout=timeout + 10,
                         )
 
-            except asyncio.CancelledError:
-                raise
-            except aiohttp.ClientError:
-                logger.warning("Failed to query Overpass API at %s", endpoint)
-                continue
-            except Exception:
-                # One bad endpoint or response must not abort the whole request.
-                logger.exception("Unexpected error querying Overpass at %s", endpoint)
-                continue
-
-        logger.error("All Overpass endpoints failed")
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data
+                        elif resp.status in (429, 500, 502, 503, 504):
+                            logger.warning(
+                                "Overpass endpoint %s returned %d, trying next",
+                                endpoint,
+                                resp.status,
+                            )
+                            await asyncio.sleep(1)
+                        else:
+                            # Truncate the body ourselves: ClientResponse.text()
+                            # takes no size argument.
+                            body = (await resp.text())[:2000]
+                            logger.warning(
+                                "Overpass returned status %d: %s", resp.status, body
+                            )
+                except aiohttp.ClientError:
+                    logger.warning("Failed to query Overpass API at %s", endpoint)
+                except asyncio.TimeoutError:
+                    logger.warning("Overpass query timed out at %s", endpoint)
+                except Exception:
+                    logger.exception("Unexpected error querying Overpass at %s", endpoint)
+            if attempt < OVERPASS_PASSES - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+        logger.error("All Overpass endpoints failed after %d passes", OVERPASS_PASSES)
         return None
 
 
 class RoadFeatureProvider:
     """Fetch road network data from the Overpass API.
 
-    Supported highway types (default query fetches "major" roads):
-      motorway, trunk, primary, secondary, tertiary, residential
+    Supported highway types (default query): motorway, trunk, primary,
+    secondary, tertiary, residential, unclassified, living_street, service.
     """
 
     def __init__(self, user_agent: Optional[str] = None):
@@ -100,6 +157,7 @@ class RoadFeatureProvider:
         south: float,
         east: float,
         north: float,
+        highway_types: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Fetch road geometries for the bounding box."""
         if not all(-180 <= c <= 180 for c in [west, east]):
@@ -111,22 +169,13 @@ class RoadFeatureProvider:
                 f"Invalid latitude bounds: {south}, {north}"
             )
 
-        highway_types = ["motorway", "trunk", "primary", "secondary"]
-        filters = []
-        for htype in highway_types:
-            filters.append('["highway"="' + htype + '"]')
-
-        filter_str = " ".join(filters)
-
-        query_str = (
-            "[out:json][timeout:60];\n"
-            f"( way {filter_str} ({south},{west},{north},{east}); );\n"
-            "out geom;"
-        )
+        query_str = build_road_query(west, south, east, north, highway_types)
 
         data = await self._client.query(query_str)
         if data is None:
-            return []
+            raise OverpassUnavailableError(
+                "OpenStreetMap (Overpass) is not responding right now"
+            )
 
         elements = data.get("elements", [])
         roads = [elem for elem in elements if elem.get("type") == "way"]
@@ -169,7 +218,9 @@ class BuildingFeatureProvider:
 
         data = await self._client.query(query_str)
         if data is None:
-            return []
+            raise OverpassUnavailableError(
+                "OpenStreetMap (Overpass) is not responding right now"
+            )
 
         elements = data.get("elements", [])
         # Keep every way that carries any building tag: the query already asks
@@ -197,9 +248,15 @@ async def get_feature_data(
     Empty lists are returned if API fails or data unavailable.
     """
     if road_highways is None:
-        road_highways = ["motorway", "trunk", "primary", "secondary"]
+        road_highways = list(DEFAULT_HIGHWAY_TYPES)
 
-    roads = await RoadFeatureProvider().fetch_roads(west, south, east, north)
+    roads: List[Dict] = []
+    try:
+        roads = await RoadFeatureProvider().fetch_roads(
+            west, south, east, north, road_highways
+        )
+    except OverpassUnavailableError:
+        logger.debug("Road feature fetch failed for area")
     buildings: List[Dict] = []
 
     if include_buildings:
@@ -207,7 +264,7 @@ async def get_feature_data(
             buildings = await BuildingFeatureProvider().fetch_buildings(
                 west, south, east, north
             )
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, OverpassUnavailableError):
             logger.debug("Building feature fetch failed for area")
 
     return {"roads": roads, "buildings": buildings}

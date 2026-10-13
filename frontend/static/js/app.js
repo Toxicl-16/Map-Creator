@@ -53,8 +53,12 @@
       "sel-state", "sel-size", "sel-centre", "sel-corners", "clear-selection",
       "use-viewport", "width-mm", "depth-mm", "min-mm", "max-mm", "base-mm",
       "resolution", "exaggeration", "exag-out", "include-roads",
-      "include-buildings", "include-contours", "contour-fields",
-      "contour-interval", "contours-engraved", "generate", "generate-hint",
+      "include-buildings", "include-contours", "layered", "layer-fields",
+      "layer-interval", "road-fields", "road-width",
+      "road-height", "building-fields", "building-height", "building-scale",
+      "building-scale-out", "contour-fields", "contour-layer-hint",
+      "contour-interval", "contour-thickness", "contour-height",
+      "contours-engraved", "generate", "generate-hint",
       "progress", "progress-fill", "progress-label", "stages", "result-panel",
       "preview", "preview-canvas", "preview-loading", "preview-fallback",
       "stats", "validation", "validation-label", "validation-list", "download",
@@ -542,9 +546,17 @@
       resolution: numberField("resolution"),
       exaggeration: numberField("exaggeration"),
       roads: els["include-roads"].checked,
+      roadWidth: numberField("road-width"),
+      roadHeight: numberField("road-height"),
       buildings: els["include-buildings"].checked,
+      buildingHeight: numberField("building-height"),
+      buildingScale: numberField("building-scale"),
       contours: els["include-contours"].checked,
       contourInterval: numberField("contour-interval"),
+      contourThickness: numberField("contour-thickness"),
+      contourHeight: numberField("contour-height"),
+      layered: els["layered"].checked,
+      layerInterval: numberField("layer-interval"),
       engrave: els["contours-engraved"].checked
     };
   }
@@ -581,6 +593,17 @@
     els["generate"].disabled = busy || !!problem;
     els["generate"].querySelector(".btn__label").textContent =
       busy ? "Generating…" : "Generate model";
+  }
+
+  /** Show a feature's tuning fields only while that feature is enabled. */
+  function syncFeatureFields() {
+    els["layer-fields"].hidden = !els["layered"].checked;
+    els["road-fields"].hidden = !els["include-roads"].checked;
+    els["building-fields"].hidden = !els["include-buildings"].checked;
+    els["contour-fields"].hidden = !els["include-contours"].checked;
+    els["contour-layer-hint"].hidden = !(
+      els["include-contours"].checked && els["layered"].checked
+    );
   }
 
   // -- Search -----------------------------------------------------------------
@@ -646,9 +669,17 @@
       vertical_exaggeration: form.exaggeration,
       base_thickness_mm: form.base,
       include_roads: form.roads,
+      road_width_mm: form.roadWidth,
+      road_height_mm: form.roadHeight,
       include_buildings: form.buildings,
+      building_height_mm: form.buildingHeight,
+      building_height_scale: form.buildingScale,
+      layer_terrain: form.layered,
+      layer_interval_m: form.layerInterval,
       include_contours: form.contours,
       contour_interval_m: form.contourInterval,
+      contour_thickness_mm: form.contourThickness,
+      contour_height_mm: form.contourHeight,
       contours_engraved: form.engrave
     };
 
@@ -823,10 +854,20 @@
     renderValidation(validation);
     els["download"].hidden = false;
 
-    var warnings = [];
-    var requestedFeatures = result.requested_features;
-    if (requestedFeatures && !features.roads && !features.buildings && !features.contours) {
-      warnings.push("OpenStreetMap has no roads or buildings mapped in this area.");
+    var warnings = (result.warnings || []).slice();
+    var requestedFeatures = result.requested_features || [];
+    function requested(name) { return requestedFeatures.indexOf(name) !== -1; }
+    function alreadyMentions(word) {
+      return warnings.some(function (w) { return w.toLowerCase().indexOf(word) !== -1; });
+    }
+    if (requested("roads") && !features.roads && !alreadyMentions("road")) {
+      warnings.push("No roads were found for this area.");
+    }
+    if (requested("buildings") && !features.buildings && !alreadyMentions("building")) {
+      warnings.push("No buildings were found for this area.");
+    }
+    if (requested("contours") && !features.contours && !alreadyMentions("contour")) {
+      warnings.push("No contour lines fell within this area's elevation range.");
     }
     if (result.triangles > 250000) {
       warnings.push("This model is very detailed — some slicers may struggle with it.");
@@ -1063,7 +1104,9 @@
       setStatus("Selected the whole map view.");
     });
 
-    ["width-mm", "depth-mm", "min-mm", "max-mm", "base-mm", "resolution"]
+    ["width-mm", "depth-mm", "min-mm", "max-mm", "base-mm", "resolution",
+     "road-width", "road-height", "building-height", "contour-interval",
+     "contour-thickness", "contour-height", "layer-interval"]
       .forEach(function (id) {
         els[id].addEventListener("input", updateGenerateAvailability);
       });
@@ -1073,8 +1116,14 @@
       updateGenerateAvailability();
     });
 
-    els["include-contours"].addEventListener("change", function () {
-      els["contour-fields"].hidden = !els["include-contours"].checked;
+    els["building-scale"].addEventListener("input", function () {
+      els["building-scale-out"].textContent =
+        parseFloat(els["building-scale"].value).toFixed(1) + "×";
+      updateGenerateAvailability();
+    });
+
+    ["layered", "include-roads", "include-buildings", "include-contours"].forEach(function (id) {
+      els[id].addEventListener("change", syncFeatureFields);
     });
 
     els["generate"].addEventListener("click", onGenerate);
@@ -1135,7 +1184,9 @@
     cacheElements();
     initMap();
     bindEvents();
-    els["contour-fields"].hidden = !els["include-contours"].checked;
+    syncFeatureFields();
+    els["building-scale-out"].textContent =
+      parseFloat(els["building-scale"].value).toFixed(1) + "×";
     updateGenerateAvailability();
     checkHealth();
   }

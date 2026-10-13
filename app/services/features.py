@@ -3,14 +3,15 @@
 Roads, buildings and contours are all expressed as modifications of the same
 heightfield the terrain mesh is built from:
 
-* **Roads** raise a ribbon of the surface to a locally smoothed terrain
-  profile plus ``road_height_mm``, so a road reads as a flat-ish causeway
-  rather than following every bump.
+* **Roads** raise their ribbon to a flat-topped, vertical-sided strip, so a
+  road reads as a clean raised rectangle rather than a rounded causeway.
 * **Buildings** raise their footprint to a fixed height above the local
-  ground. OSM rarely has reliable heights, so ``building_height_mm`` is used
-  unless the footprint carries ``height``/``building:levels`` tags.
-* **Contours** are marching-squares isolines of the elevation grid, drawn as
-  narrow ridges (raised) or grooves (engraved).
+  ground. Untagged footprints use ``building_height_mm``; footprints that carry
+  ``height``/``building:levels`` tags keep their relative stature, and
+  ``height_scale`` scales the whole layer.
+* **Contours** are marching-squares isolines of the elevation grid, blended into
+  the surface as narrow smooth ridges (raised) or grooves (engraved), so the
+  terrain and its rings stay smooth.
 
 Merging into the heightfield — rather than unioning separate solids — is what
 keeps the exported mesh watertight and 2-manifold.
@@ -93,16 +94,16 @@ def _grid_layout(rows: int, cols: int, width_mm: float, depth_mm: float):
     return x, y, (x[1] - x[0]) if cols > 1 else 1.0, (y[1] - y[0]) if rows > 1 else 1.0
 
 
-def _sample_grid(values: np.ndarray, x_axis, y_axis, xs, ys):
-    """Nearest-neighbour sample of ``values`` at millimetre coordinates."""
-    cols = values.shape[1]
-    rows = values.shape[0]
+def _cell_axes(rows: int, cols: int, width_mm: float, depth_mm: float):
+    """Cell-centre axes: one sample per grid cell instead of per vertex.
 
-    j = np.searchsorted(x_axis, xs) - 0.5
-    i = np.searchsorted(y_axis, ys) - 0.5
-    j = np.clip(np.round(j).astype(int), 0, cols - 1)
-    i = np.clip(np.round(i).astype(int), 0, rows - 1)
-    return values[i, j]
+    Feature masks are stamped per cell (a cell is covered when its centre is
+    covered), which lets the mesh builder extrude flat roofs and vertical walls.
+    The last row/column of a mask produced against these axes is never set.
+    """
+    x = np.linspace(-width_mm / 2.0, width_mm / 2.0, cols)
+    y = np.linspace(-depth_mm / 2.0, depth_mm / 2.0, rows)
+    return (x[:-1] + x[1:]) / 2.0, (y[:-1] + y[1:]) / 2.0
 
 
 # ── OSM element helpers ───────────────────────────────────────────────────────
@@ -179,61 +180,6 @@ def _outer_ring(way: dict) -> list[tuple[float, float]]:
 # ── rasterisation primitives ──────────────────────────────────────────────────
 
 
-def _stamp_disc(mask: np.ndarray, x_axis, y_axis, cx: float, cy: float, radius_mm: float) -> None:
-    """Mark grid cells whose centre lies within ``radius_mm`` of (cx, cy)."""
-    if radius_mm <= 0:
-        return
-
-    j0 = int(np.searchsorted(x_axis, cx - radius_mm))
-    j1 = int(np.searchsorted(x_axis, cx + radius_mm))
-    i0 = int(np.searchsorted(y_axis, cy - radius_mm))
-    i1 = int(np.searchsorted(y_axis, cy + radius_mm))
-    if j1 <= j0 or i1 <= i0:
-        return
-
-    xs = x_axis[j0:j1]
-    ys = y_axis[i0:i1]
-    dx = (xs - cx) ** 2
-    dy = (ys - cy) ** 2
-    block = dx[None, :] + dy[:, None] <= radius_mm ** 2
-    mask[i0:i1, j0:j1] |= block
-
-
-def _stamp_segment(
-    mask: np.ndarray,
-    x_axis,
-    y_axis,
-    p0: tuple[float, float],
-    p1: tuple[float, float],
-    radius_mm: float,
-) -> None:
-    """Mark cells within ``radius_mm`` of the segment p0→p1."""
-    x0, y0 = p0
-    x1, y1 = p1
-    j0 = int(np.searchsorted(x_axis, min(x0, x1) - radius_mm))
-    j1 = int(np.searchsorted(x_axis, max(x0, x1) + radius_mm))
-    i0 = int(np.searchsorted(y_axis, min(y0, y1) - radius_mm))
-    i1 = int(np.searchsorted(y_axis, max(y0, y1) + radius_mm))
-    if j1 <= j0 or i1 <= i0:
-        return
-
-    xs = x_axis[j0:j1]
-    ys = y_axis[i0:i1]
-    gx = xs[None, :]
-    gy = ys[:, None]
-
-    dx = x1 - x0
-    dy = y1 - y0
-    length_sq = dx * dx + dy * dy
-    if length_sq < 1e-9:
-        dist_sq = (gx - x0) ** 2 + (gy - y0) ** 2
-    else:
-        t = np.clip(((gx - x0) * dx + (gy - y0) * dy) / length_sq, 0.0, 1.0)
-        dist_sq = (gx - (x0 + t * dx)) ** 2 + (gy - (y0 + t * dy)) ** 2
-
-    mask[i0:i1, j0:j1] |= dist_sq <= radius_mm ** 2
-
-
 def _segment_block(x_axis, y_axis, p0, p1, radius_mm):
     """Grid bounding box of the capsule around segment p0→p1, or None."""
     x0, y0 = p0
@@ -247,47 +193,68 @@ def _segment_block(x_axis, y_axis, p0, p1, radius_mm):
     return i0, i1, j0, j1
 
 
-def _stamp_segment_z(
-    mask: np.ndarray,
-    z: np.ndarray,
-    x_axis,
-    y_axis,
-    p0: tuple[float, float],
-    p1: tuple[float, float],
-    radius_mm: float,
-    z0: float,
-    z1: float,
-) -> None:
-    """Raise a capsule around p0→p1, grading the target height z0→z1 along it.
+def _smooth_falloff(dist, inner: float, outer: float):
+    """C1 smoothstep weight: 1 inside ``inner``, 0 beyond ``outer``.
 
-    The footprint written here is exactly the footprint set in ``mask``, so a
-    masked cell can never be left without a height.
+    Feathering feature ridges into the surrounding terrain with a C1 ramp is
+    what stops roads and contour rings from reading as vertical-walled,
+    staircased blocks: the ridge meets the ground with zero slope, so the
+    surface stays smooth.
     """
-    block = _segment_block(x_axis, y_axis, p0, p1, radius_mm)
-    if block is None:
-        return
-    i0, i1, j0, j1 = block
+    d = np.asarray(dist, dtype=np.float64)
+    if outer <= inner:
+        return (d <= inner).astype(np.float64)
+    t = np.clip((d - inner) / (outer - inner), 0.0, 1.0)
+    return 1.0 - t * t * (3.0 - 2.0 * t)
 
-    x0, y0 = p0
-    x1, y1 = p1
-    gx = x_axis[j0:j1][None, :]
-    gy = y_axis[i0:i1][:, None]
 
+def _segment_distance(gx, gy, x0: float, y0: float, x1: float, y1: float):
+    """Distance from every point in the broadcast grid to segment p0→p1."""
     dx = x1 - x0
     dy = y1 - y0
     length_sq = dx * dx + dy * dy
     if length_sq < 1e-9:
-        t = np.zeros_like(gx)
-        dist_sq = (gx - x0) ** 2 + (gy - y0) ** 2
-    else:
-        t = np.clip(((gx - x0) * dx + (gy - y0) * dy) / length_sq, 0.0, 1.0)
-        dist_sq = (gx - (x0 + t * dx)) ** 2 + (gy - (y0 + t * dy)) ** 2
+        return np.hypot(gx - x0, gy - y0)
+    t = np.clip(((gx - x0) * dx + (gy - y0) * dy) / length_sq, 0.0, 1.0)
+    return np.hypot(gx - (x0 + t * dx), gy - (y0 + t * dy))
 
-    covered = dist_sq <= radius_mm ** 2
-    height = z0 + t * (z1 - z0)
-    mask[i0:i1, j0:j1] |= covered
-    window = z[i0:i1, j0:j1]
-    np.maximum(window, height, out=window, where=covered)
+
+def _stamp_road(mask, x_axis, y_axis, p0, p1, half: float) -> None:
+    """Rasterise a rectangular road strip around segment p0→p1.
+
+    Every cell whose centre lies within ``half`` of the centreline is filled,
+    giving a flat-topped ribbon with vertical sides: a raised rectangle rather
+    than a rounded causeway.
+    """
+    block = _segment_block(x_axis, y_axis, p0, p1, half)
+    if block is None:
+        return
+    i0, i1, j0, j1 = block
+    gx = x_axis[j0:j1][None, :]
+    gy = y_axis[i0:i1][:, None]
+    dist = _segment_distance(gx, gy, p0[0], p0[1], p1[0], p1[1])
+    mask[i0:i1, j0:j1] |= dist <= half
+
+
+def _stamp_contour(
+    mask, offset, x_axis, y_axis, p0, p1, inner, outer, height, engraved
+) -> None:
+    """Accumulate a smooth contour-ridge/groove around segment p0→p1."""
+    block = _segment_block(x_axis, y_axis, p0, p1, outer)
+    if block is None:
+        return
+    i0, i1, j0, j1 = block
+    gx = x_axis[j0:j1][None, :]
+    gy = y_axis[i0:i1][:, None]
+    dist = _segment_distance(gx, gy, p0[0], p0[1], p1[0], p1[1])
+
+    contribution = _smooth_falloff(dist, inner, outer) * abs(float(height))
+    window = offset[i0:i1, j0:j1]
+    if engraved:
+        np.minimum(window, -contribution, out=window)
+    else:
+        np.maximum(window, contribution, out=window)
+    mask[i0:i1, j0:j1] |= dist <= inner
 
 
 def _fill_polygon(mask: np.ndarray, x_axis, y_axis, ring: Sequence[tuple[float, float]]) -> bool:
@@ -298,9 +265,9 @@ def _fill_polygon(mask: np.ndarray, x_axis, y_axis, ring: Sequence[tuple[float, 
     xs = [p[0] for p in ring]
     ys = [p[1] for p in ring]
     j0 = max(int(np.searchsorted(x_axis, min(xs))), 0)
-    j1 = min(int(np.searchsorted(x_axis, max(xs))) + 1, mask.shape[1])
+    j1 = min(int(np.searchsorted(x_axis, max(xs))) + 1, len(x_axis))
     i0 = max(int(np.searchsorted(y_axis, min(ys))), 0)
-    i1 = min(int(np.searchsorted(y_axis, max(ys))) + 1, mask.shape[0])
+    i1 = min(int(np.searchsorted(y_axis, max(ys))) + 1, len(y_axis))
     if j1 <= j0 or i1 <= i0:
         return False
 
@@ -336,18 +303,25 @@ def build_roads(
     min_width_mm: float,
     smoothing_passes: int = 1,
 ) -> dict:
-    """Rasterise OSM road centrelines into a raised-ribbon mask.
+    """Rasterise OSM road centrelines into raised rectangular strips.
 
-    The target height follows a profile smoothed along the way, so long roads
-    read as graded causeways instead of draping over every terrain bump.
+    A road is a flat-topped ribbon raised ``height_mm`` above the ground with
+    vertical sides, so it reads as a clean raised rectangle rather than a
+    rounded causeway. The returned ``raise`` field is a per-vertex offset in the
+    same units as ``surface`` (millimetres in the pipeline), which the mesh
+    builder folds into the terrain. ``mask`` records the ribbon footprint.
     """
     rows, cols = surface.shape
     x_axis, y_axis, _, _ = _grid_layout(rows, cols, transform.width_mm, transform.depth_mm)
 
     mask = np.zeros((rows, cols), dtype=bool)
-    z = np.full((rows, cols), -np.inf, dtype=np.float64)
 
-    radius = max(min_width_mm, width_mm, (transform.width_mm / cols) * 0.25, (transform.depth_mm / rows) * 0.25) / 2.0
+    # Keep the strip at least a cell wide so a thin road never slips between
+    # vertices on a coarse grid.
+    cell_x = transform.width_mm / max(cols - 1, 1)
+    cell_y = transform.depth_mm / max(rows - 1, 1)
+    cell = float(min(cell_x, cell_y))
+    half = max(width_mm, min_width_mm, cell) / 2.0
 
     for way in ways:
         nodes = _way_nodes(way)
@@ -364,46 +338,12 @@ def build_roads(
         if len(clipped) < 2:
             continue
 
-        profile = _sample_grid(
-            surface, x_axis, y_axis,
-            np.array([p[0] for p in clipped]),
-            np.array([p[1] for p in clipped]),
-        )
-        for _ in range(max(0, smoothing_passes)):
-            profile = _running_mean(profile)
-        target = profile + height_mm
-
         for k in range(len(clipped) - 1):
-            # Stamp mask and height over the same footprint, grading the height
-            # linearly along the segment so the causeway stays continuous.
-            z0 = float(target[k])
-            z1 = float(target[k + 1])
-            _stamp_segment_z(
-                mask, z, x_axis, y_axis,
-                clipped[k], clipped[k + 1], radius, z0, z1,
-            )
+            _stamp_road(mask, x_axis, y_axis, clipped[k], clipped[k + 1], half)
 
-    return {"mask": mask, "z": np.where(mask, z, -np.inf)}
-
-
-def _disc_indices(x_axis, y_axis, centre, radius_mm):
-    cx, cy = centre
-    j0 = int(np.searchsorted(x_axis, cx - radius_mm))
-    j1 = int(np.searchsorted(x_axis, cx + radius_mm))
-    i0 = int(np.searchsorted(y_axis, cy - radius_mm))
-    i1 = int(np.searchsorted(y_axis, cy + radius_mm))
-    if j1 <= j0 or i1 <= i0:
-        return None
-    return i0, i1, j0, j1
-
-
-def _running_mean(values: np.ndarray, window: int = 5) -> np.ndarray:
-    """Centred moving average used to grade road profiles."""
-    if values.size < 3:
-        return values
-    kernel = np.ones(window) / window
-    padded = np.pad(values, (window // 2, window // 2), mode="edge")
-    return np.convolve(padded, kernel, mode="valid")[: values.size]
+    raise_field = np.where(mask, float(height_mm), 0.0)
+    z = surface + raise_field
+    return {"mask": mask, "z": np.where(mask, z, -np.inf), "raise": raise_field}
 
 
 def build_buildings(
@@ -414,16 +354,24 @@ def build_buildings(
     height_mm: float,
     min_height_mm: float,
     footprint_scale: float = 1.0,
-    mm_per_m: float = 0.1,
+    height_scale: float = 1.0,
+    reference_height_m: float = 6.0,
 ) -> dict:
     """Rasterise building footprints into raised blocks.
 
-    Heights come from OSM tags when available and fall back to
-    ``height_mm`` otherwise; ``footprint_scale`` grows or shrinks the outline
-    around its centroid so footprints stay visible on coarse grids.
+    Untagged footprints are raised by ``height_mm``. Footprints carrying a real
+    OSM height keep their *relative* stature — a church is taller than a shed —
+    by scaling ``height_mm`` with the ratio of the tagged height to
+    ``reference_height_m``, clamped to a sensible band so a single tower cannot
+    swallow the model. ``height_scale`` then multiplies every building, so one
+    control scales the whole layer up or down.
+
+    ``footprint_scale`` grows or shrinks the outline around its centroid so
+    footprints stay visible on coarse grids.
     """
     rows, cols = surface.shape
     x_axis, y_axis, _, _ = _grid_layout(rows, cols, transform.width_mm, transform.depth_mm)
+    cx, cy = _cell_axes(rows, cols, transform.width_mm, transform.depth_mm)
 
     mask = np.zeros((rows, cols), dtype=bool)
     z = np.full((rows, cols), -np.inf, dtype=np.float64)
@@ -436,14 +384,14 @@ def build_buildings(
 
         model_ring = [transform.to_model(lon, lat) for lat, lon in ring]
         if footprint_scale != 1.0:
-            cx = float(np.mean([p[0] for p in model_ring]))
-            cy = float(np.mean([p[1] for p in model_ring]))
+            cx_m = float(np.mean([p[0] for p in model_ring]))
+            cy_m = float(np.mean([p[1] for p in model_ring]))
             model_ring = [
-                (cx + (x - cx) * scale, cy + (y - cy) * scale) for x, y in model_ring
+                (cx_m + (x - cx_m) * scale, cy_m + (y - cy_m) * scale) for x, y in model_ring
             ]
 
         before = mask.copy()
-        if not _fill_polygon(mask, x_axis, y_axis, model_ring):
+        if not _fill_polygon(mask, cx, cy, model_ring):
             continue
         cells = mask & ~before
         if not cells.any():
@@ -451,13 +399,23 @@ def build_buildings(
 
         # Take the highest ground the footprint actually covers, so a flat-topped
         # block never sinks into the uphill side of a slope.
-        ground = float(np.max(surface[cells]))
+        ci, cj = np.nonzero(cells)
+        corners = np.stack([
+            surface[ci, cj],
+            surface[ci, cj + 1],
+            surface[ci + 1, cj],
+            surface[ci + 1, cj + 1],
+        ])
+        ground = float(corners.max())
 
         tags = way.get("tags") or {}
-        real_mm = _building_height_m(tags, default_m=0.0) * mm_per_m
-        height = max(min_height_mm, real_mm if real_mm > 0 else height_mm)
+        real_m = _building_height_m(tags, default_m=0.0)
+        ratio = 1.0
+        if real_m > 0 and reference_height_m > 0:
+            ratio = float(np.clip(real_m / reference_height_m, 0.25, 4.0))
+        height = max(min_height_mm, height_mm * ratio) * max(height_scale, 0.0)
 
-        block = _region_of(x_axis, y_axis, model_ring)
+        block = _region_of(cx, cy, model_ring)
         if block is not None:
             i0, i1, j0, j1 = block
             local = z[i0:i1, j0:j1]
@@ -523,6 +481,10 @@ def build_contours(
         y = -depth_mm / 2.0 + (row_idx / (rows - 1)) * depth_mm
         return x, y
 
+    cell_x = width_mm / max(cols - 1, 1)
+    cell_y = depth_mm / max(rows - 1, 1)
+    cell = float(min(cell_x, cell_y))
+
     mask = np.zeros((rows, cols), dtype=bool)
     offset = np.zeros((rows, cols), dtype=np.float64)
     major_stride = max(major_every, 1)
@@ -538,16 +500,15 @@ def build_contours(
         if not segments:
             continue
 
-        before = mask.copy()
+        # Flat-top ridge (thickness) with a smooth shoulder, so the line reads
+        # as a clean ring instead of a staircased block of cells.
+        outer = thickness + max(cell, thickness)
         for (ax, ay), (bx, by) in segments:
-            _stamp_segment(
-                mask, x_axis, y_axis, to_model(ax, ay), to_model(bx, by), thickness
+            _stamp_contour(
+                mask, offset, x_axis, y_axis,
+                to_model(ax, ay), to_model(bx, by),
+                thickness, outer, height, engraved,
             )
-
-        # Only cells this level newly claimed take this level's height, so
-        # overlapping majors win over intermediates.
-        fresh = mask & ~before
-        np.maximum(offset, height, out=offset, where=fresh)
 
     if engraved:
         offset = -np.abs(offset)

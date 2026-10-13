@@ -157,6 +157,11 @@
       <div class="panel__body">
         <div class="switches">
           <label class="switch">
+            <input type="checkbox" id="layered" checked>
+            <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+            <span class="switch__text">Elevation layers<span class="switch__sub">Smooth contour rings across the terrain</span></span>
+          </label>
+          <label class="switch">
             <input type="checkbox" id="include-roads">
             <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
             <span class="switch__text">Roads<span class="switch__sub">OpenStreetMap network</span></span>
@@ -172,16 +177,54 @@
             <span class="switch__text">Contour lines<span class="switch__sub">Raised or engraved</span></span>
           </label>
         </div>
+        <div class="sub-fields" id="layer-fields">
+          <label class="field">
+            <span class="field__label">Layer thickness <span class="field__unit">m</span></span>
+            <input class="field__input" id="layer-interval" type="number" value="0" min="0" max="500" step="5" inputmode="numeric">
+          </label>
+          <p class="hint">0 = use the contour interval.</p>
+        </div>
+        <div class="sub-fields" id="road-fields" hidden>
+          <label class="field">
+            <span class="field__label">Road width <span class="field__unit">mm</span></span>
+            <input class="field__input" id="road-width" type="number" value="3" min="0.5" max="20" step="0.5" inputmode="decimal">
+          </label>
+          <label class="field">
+            <span class="field__label">Road height <span class="field__unit">mm</span></span>
+            <input class="field__input" id="road-height" type="number" value="2" min="0.2" max="20" step="0.2" inputmode="decimal">
+          </label>
+        </div>
+
+        <div class="sub-fields" id="building-fields" hidden>
+          <label class="field">
+            <span class="field__label">Building height <span class="field__unit">mm</span></span>
+            <input class="field__input" id="building-height" type="number" value="12" min="1" max="50" step="1" inputmode="decimal">
+          </label>
+          <label class="field">
+            <span class="field__label">Height scale <output class="field__out" id="building-scale-out">1.0×</output></span>
+            <input class="slider" id="building-scale" type="range" min="0.5" max="4" step="0.1" value="1">
+          </label>
+        </div>
+
         <div class="sub-fields" id="contour-fields" hidden>
           <label class="field">
             <span class="field__label">Interval <span class="field__unit">m</span></span>
             <input class="field__input" id="contour-interval" type="number" value="20" min="5" max="500" step="5" inputmode="numeric">
+          </label>
+          <label class="field">
+            <span class="field__label">Line width <span class="field__unit">mm</span></span>
+            <input class="field__input" id="contour-thickness" type="number" value="0.6" min="0.2" max="5" step="0.1" inputmode="decimal">
+          </label>
+          <label class="field">
+            <span class="field__label">Line height <span class="field__unit">mm</span></span>
+            <input class="field__input" id="contour-height" type="number" value="0.8" min="0.1" max="5" step="0.1" inputmode="decimal">
           </label>
           <label class="switch switch--inline">
             <input type="checkbox" id="contours-engraved">
             <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
             <span class="switch__text">Engrave instead of raise</span>
           </label>
+          <p class="hint" id="contour-layer-hint" hidden>With elevation layers on, these rings are drawn at the layer interval, so this interval sets the layer spacing.</p>
         </div>
       </div>
     </section>

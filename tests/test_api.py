@@ -169,6 +169,8 @@ def test_static_files_mounted(client):
         {"resolution_m": 5},  # under the floor
         {"min_altitude_mm": 40, "max_altitude_mm": 30},  # inverted heights
         {"base_thickness_mm": -1},  # negative
+        {"building_height_scale": 0},  # not positive
+        {"building_height_scale": 7},  # over the cap
     ],
 )
 def test_invalid_requests_are_rejected(client, overrides):
@@ -259,6 +261,50 @@ def test_generate_with_features(client, stub_features):
 
     assert body["features"]["roads"] > 0
     assert body["features"]["buildings"] > 0
+    assert body["features"]["contours"] > 0
+    assert body["validation"]["watertight"] is True
+    assert body["validation"]["manifold"] is True
+
+
+def test_height_controls_are_accepted(client, stub_features):
+    """Road/building/contour height and scale controls reach the pipeline."""
+    progress, _ = run_job(
+        client,
+        base_request(
+            include_roads=True,
+            include_buildings=True,
+            include_contours=True,
+            road_width_mm=6.0,
+            road_height_mm=4.0,
+            building_height_mm=20.0,
+            building_height_scale=2.0,
+            contour_interval_m=10,
+            contour_thickness_mm=1.5,
+            contour_height_mm=1.2,
+        ),
+    )
+    assert progress["error"] is None
+    body = progress["result"]
+    assert body["features"]["roads"] > 0
+    assert body["features"]["buildings"] > 0
+    assert body["features"]["contours"] > 0
+    assert body["validation"]["watertight"] is True
+    assert body["validation"]["manifold"] is True
+
+
+def test_layered_terrain_is_accepted(client):
+    """Elevation-layer rings land in the same watertight pipeline."""
+    progress, _ = run_job(
+        client,
+        base_request(
+            layer_terrain=True,
+            layer_interval_m=20,
+            include_contours=True,
+            contour_interval_m=20,
+        ),
+    )
+    assert progress["error"] is None
+    body = progress["result"]
     assert body["features"]["contours"] > 0
     assert body["validation"]["watertight"] is True
     assert body["validation"]["manifold"] is True
@@ -447,3 +493,105 @@ def test_prune_downloads_tolerates_missing_directory(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "DOWNLOADS_DIR", tmp_path / "absent")
     assert routes._prune_downloads() == 0
+
+
+# -- feature resilience -------------------------------------------------------
+
+
+def test_adaptive_contour_interval_refines_when_requested_step_misses_relief():
+    """A 20 m interval over a 12 m rise crosses no elevation, so no lines would
+    be drawn; the helper picks a finer, nicely-rounded step instead."""
+    from app.api.routes import _adaptive_contour_interval
+
+    grid = np.linspace(100.0, 112.0, 40).reshape(5, 8)  # relief 12 m
+    effective = _adaptive_contour_interval(grid, 20.0)
+    assert effective < 20.0
+    assert effective > 0.0
+    lo = int(np.floor(100.0 / effective))
+    hi = int(np.ceil(112.0 / effective))
+    inside = [k for k in range(lo, hi + 1) if 100.0 < k * effective < 112.0]
+    assert len(inside) >= 2
+
+
+def test_adaptive_contour_interval_keeps_a_step_that_already_fits():
+    from app.api.routes import _adaptive_contour_interval
+
+    grid = np.linspace(100.0, 180.0, 40).reshape(5, 8)  # relief 80 m
+    assert _adaptive_contour_interval(grid, 20.0) == 20.0
+
+
+def test_contours_appear_when_requested_interval_exceeds_the_relief(monkeypatch):
+    """Regression for a rural address: a ~10 m relief gave zero 20 m contours."""
+    from app.api import routes
+    from app.geospatial.providers import elevation as elevation_module
+
+    i = np.arange(47)[:, None]
+    j = np.arange(38)[None, :]
+    flat = 100.0 + 6.0 * (i / 46.0) + 4.0 * (j / 37.0)  # ~10 m relief
+
+    async def fake_fetch(west, south, east, north, resolution_m=30.0):
+        return flat
+
+    monkeypatch.setattr(
+        elevation_module.SRTMTileFetcher, "fetch_elevation", fake_fetch
+    )
+
+    with TestClient(routes.app) as test_client:
+        progress, _ = run_job(
+            test_client,
+            base_request(include_contours=True, contour_interval_m=20),
+        )
+
+    assert progress["error"] is None
+    body = progress["result"]
+    assert body["features"]["contours"] > 0
+    assert any("contour" in w.lower() for w in body["warnings"])
+
+
+def test_overpass_outage_warns_but_still_builds_terrain(client, monkeypatch):
+    """Roads requested while Overpass is down must not fail the job silently."""
+    from app.api import routes
+    from app.geospatial.providers.vector import OverpassUnavailableError
+
+    async def boom(bounds):
+        raise OverpassUnavailableError("all endpoints failed")
+
+    monkeypatch.setattr(routes, "_fetch_roads", boom)
+
+    progress, _ = run_job(client, base_request(include_roads=True))
+
+    assert progress["error"] is None
+    body = progress["result"]
+    assert body["features"]["roads"] == 0
+    assert any("road" in w.lower() for w in body["warnings"])
+
+
+def test_layered_elevation_draws_contour_rings(client):
+    """With elevation layers on, smooth contour rings trace the terrain."""
+    progress, _ = run_job(
+        client,
+        base_request(
+            layer_terrain=True,
+            include_contours=True,
+            contour_interval_m=10,
+        ),
+    )
+
+    assert progress["error"] is None
+    body = progress["result"]
+    assert body["features"]["contours"] > 0
+    assert body["validation"]["valid_stl"]
+    assert not any("no contour" in w.lower() for w in body["warnings"])
+
+
+def test_detail_is_refined_when_layers_are_on(client):
+    """Elevation layers request a finer mesh than the raw elevation grid."""
+    progress, _ = run_job(
+        client, base_request(layer_terrain=True, resolution_m=120)
+    )
+
+    assert progress["error"] is None
+    elevation = progress["result"]["elevation"]
+    # A 120 m grid over this selection is ~22 columns; refinement should add
+    # more so the contour rings can read as smooth curves.
+    assert elevation["cols"] > 30

@@ -458,6 +458,7 @@ select.field__input {
   background: var(--grey-50);
   border: 1px solid var(--grey-150);
 }
+.sub-fields > .hint { grid-column: 1 / -1; }
 
 /* Readout */
 .readout { display: flex; flex-direction: column; gap: 1px; }

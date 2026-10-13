@@ -117,9 +117,12 @@ class CreateMeshRequest(BaseModel):
     include_roads: bool = False
     include_buildings: bool = False
     include_contours: bool = False
+    layer_terrain: bool = False
+    layer_interval_m: float = Field(0.0, ge=0, le=2000)
     road_width_mm: float = Field(3.0, gt=0, le=20)
     road_height_mm: float = Field(2.0, gt=0, le=20)
     building_height_mm: float = Field(12.0, gt=0, le=50)
+    building_height_scale: float = Field(1.0, gt=0, le=6)
     contour_interval_m: float = Field(20.0, gt=0, le=2000)
     contour_thickness_mm: float = Field(0.6, gt=0, le=10)
     contour_height_mm: float = Field(0.8, ge=-10, le=10)
@@ -183,6 +186,7 @@ class MeshInfo(BaseModel):
     elevation: dict
     features: FeatureStats
     requested_features: list[str] = []
+    warnings: list[str] = []
     ground_area_m: float = 0.0
 
 
@@ -489,6 +493,7 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
             MeshBuilder,
             TerrainGenerationError,
             TerrainSettings,
+            detail_grid,
             export_to_stl,
         )
         from app.services.validation import validate_stl_file
@@ -517,10 +522,13 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
             road_width_mm=payload.road_width_mm,
             road_height_mm=payload.road_height_mm,
             building_height_mm=payload.building_height_mm,
+            building_height_scale=payload.building_height_scale,
             contour_interval_m=payload.contour_interval_m,
             contour_thickness_mm=payload.contour_thickness_mm,
             contour_height_mm=payload.contour_height_mm,
             contours_engraved=payload.contours_engraved,
+            layer_terrain=payload.layer_terrain,
+            layer_interval_m=payload.layer_interval_m,
         )
 
         # -- Stage 1: elevation -------------------------------------------
@@ -539,9 +547,44 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
             raise PipelineError(str(exc)) from exc
 
         elev_grid = _finite(elev_grid)
+
+        # Give the contours (and the elevation-layer rings, which reuse the
+        # contour interval) a spacing that actually crosses this area's relief.
+        feature_warnings: list[str] = []
+        if payload.include_contours or payload.layer_terrain:
+            effective = _adaptive_contour_interval(
+                elev_grid, settings.contour_interval_m
+            )
+            if effective < settings.contour_interval_m:
+                logger.info(
+                    "Contour interval %.1f m exceeds the local relief; using %.3g m",
+                    settings.contour_interval_m,
+                    effective,
+                )
+                feature_warnings.append(
+                    f"Contour interval reduced to {effective:g} m to fit the "
+                    "local relief (the requested spacing crossed no elevation)."
+                )
+                settings.contour_interval_m = effective
+
+        # Elevation-layer rings and feature ribbons are drawn per grid cell, so
+        # on a coarse grid their edges look blocky. Refine the elevation grid
+        # (when a fine feature is requested) so rings and roads read as smooth
+        # curves.
+        wants_detail = (
+            payload.layer_terrain
+            or payload.include_roads
+            or payload.include_buildings
+            or payload.include_contours
+        )
+        mesh_grid = detail_grid(elev_grid, settings) if wants_detail else elev_grid
+
         builder = MeshBuilder(settings)
-        surface = builder.surface_of(elev_grid)
-        job.complete("elevation", f"Elevation ready ({elev_grid.shape[0]}×{elev_grid.shape[1]} samples)")
+        surface = builder.surface_of(mesh_grid)
+        job.complete(
+            "elevation",
+            f"Elevation ready ({mesh_grid.shape[0]}×{mesh_grid.shape[1]} samples)",
+        )
 
         # -- Stage 2: map features ----------------------------------------
         roads = buildings = contours = None
@@ -552,7 +595,15 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
             )
 
             if payload.include_roads:
-                ways = await _fetch_roads(bounds)
+                try:
+                    ways = await _fetch_roads(bounds)
+                except Exception as exc:  # Overpass outage: still ship terrain
+                    logger.warning("Could not load roads: %s", exc)
+                    feature_warnings.append(
+                        "Roads were requested but OpenStreetMap's API was "
+                        "unreachable; try generating again in a moment."
+                    )
+                    ways = []
                 roads = build_roads(
                     ways,
                     transform,
@@ -568,7 +619,15 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
                 )
 
             if payload.include_buildings:
-                ways = await _fetch_buildings(bounds)
+                try:
+                    ways = await _fetch_buildings(bounds)
+                except Exception as exc:  # Overpass outage: still ship terrain
+                    logger.warning("Could not load buildings: %s", exc)
+                    feature_warnings.append(
+                        "Buildings were requested but OpenStreetMap's API was "
+                        "unreachable; try generating again in a moment."
+                    )
+                    ways = []
                 buildings = build_buildings(
                     ways,
                     transform,
@@ -576,18 +635,27 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
                     height_mm=settings.building_height_mm,
                     min_height_mm=settings.building_height_mm / 2,
                     footprint_scale=settings.building_footprint_scale,
+                    height_scale=settings.building_height_scale,
                 )
                 logger.info(
                     "Rasterised %d building cell(s) from %d way(s)",
                     int(buildings["mask"].sum()), len(ways),
                 )
 
-            if payload.include_contours:
+            if payload.include_contours or payload.layer_terrain:
+                # The terrain stays smooth; elevation reads as smooth contour
+                # rings. "Layers" draw rings at the layer interval (the coarse
+                # bands); plain contours use the contour interval.
+                interval = (
+                    (payload.layer_interval_m or settings.contour_interval_m)
+                    if payload.layer_terrain
+                    else settings.contour_interval_m
+                )
                 contours = build_contours(
-                    elev_grid,
+                    mesh_grid,
                     width_mm=payload.model_width_mm,
                     depth_mm=payload.model_depth_mm,
-                    interval_m=settings.contour_interval_m,
+                    interval_m=interval,
                     thickness_mm=settings.contour_thickness_mm,
                     height_mm=settings.contour_height_mm,
                     engraved=settings.contours_engraved,
@@ -600,7 +668,7 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
         job.enter("mesh", "Building terrain surface and solid…")
         try:
             vertices, triangles, _surface, stats = builder.build_with_features(
-                elev_grid, roads=roads, buildings=buildings, contours=contours
+                mesh_grid, roads=roads, buildings=buildings, contours=contours
             )
         except TerrainGenerationError as exc:
             raise PipelineError(str(exc)) from exc
@@ -643,12 +711,13 @@ async def _run_pipeline(job: "Job", payload: CreateMeshRequest) -> None:
             ),
             validation=report.as_dict(),
             elevation={
-                "min_m": round(float(elev_grid.min()), 1),
-                "max_m": round(float(elev_grid.max()), 1),
-                "rows": int(elev_grid.shape[0]),
-                "cols": int(elev_grid.shape[1]),
+                "min_m": round(float(mesh_grid.min()), 1),
+                "max_m": round(float(mesh_grid.max()), 1),
+                "rows": int(mesh_grid.shape[0]),
+                "cols": int(mesh_grid.shape[1]),
             },
             features=FeatureStats(**stats),
+            warnings=feature_warnings,
             requested_features=[
                 name
                 for name, wanted in (
@@ -703,6 +772,47 @@ def _finite(grid: np.ndarray) -> np.ndarray:
         logger.warning("Elevation grid contained %d void cell(s)", voids)
         grid = ElevationDataProcessor.fill_nan(grid)
     return grid
+
+
+def _nice_step(value: float) -> float:
+    """Round a step to the nearest 1/2/5×10ⁿ so contour labels stay readable."""
+    import math
+
+    if value <= 0:
+        return value
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    for nice in (1.0, 2.0, 5.0):
+        if fraction <= nice:
+            return nice * (10 ** exponent)
+    return 10.0 ** (exponent + 1)
+
+
+def _adaptive_contour_interval(grid: np.ndarray, requested: float) -> float:
+    """Return a contour interval that actually crosses the local relief.
+
+    A 20 m interval over a gentle 15 m rise yields zero contour lines, which
+    looks like the feature is broken. When the requested spacing would produce
+    fewer than two lines, fall back to a finer, nicely-rounded step that spans
+    the relief in roughly eight bands.
+    """
+    finite = grid[np.isfinite(grid)]
+    if finite.size == 0 or requested <= 0:
+        return requested
+    vmin, vmax = float(finite.min()), float(finite.max())
+    relief = vmax - vmin
+    if relief <= 0:
+        return requested
+
+    import math
+
+    lo, hi = math.floor(vmin / requested), math.ceil(vmax / requested)
+    inside = [k for k in range(lo, hi + 1) if vmin < k * requested < vmax]
+    if len(inside) >= 2:
+        return requested
+
+    step = _nice_step(relief / 8.0)
+    return min(step, requested) if step > 0 else requested
 
 
 async def _fetch_roads(bounds: GeoBounds) -> list:
